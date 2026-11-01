@@ -323,6 +323,114 @@ test "Workbench Views: full 2-phase Pass.input -> Pass.paint layout determinism 
     try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
 }
 
+test "Outline View: rendering Zig files in Explorer Outline and @Symbol palette without corruption" {
+    const std = @import("std");
+    const skia = @import("skia");
+
+    const scale: f32 = 2.0;
+    const logical_w: f32 = 1280.0;
+    const logical_h: f32 = 800.0;
+    const surface = try skia.Surface.initRasterN32Premul(
+        @intFromFloat(logical_w * scale),
+        @intFromFloat(logical_h * scale),
+    );
+    defer surface.deinit();
+
+    const font_mgr = try skia.FontMgr.initDefault();
+    defer font_mgr.deinit();
+
+    var store = platform.StateStore.init(std.testing.allocator);
+    defer store.deinit();
+    var snap = platform.SnapshotBuffer.init(std.testing.allocator);
+    defer snap.deinit();
+    var pctx = platform.PlatformContext{
+        .font_mgr = font_mgr.ptr,
+        .width = logical_w,
+        .height = logical_h,
+        .dpi_scale = scale,
+    };
+    pctx.bindHostStores(&store, &snap);
+
+    const state = try std.testing.allocator.create(EditorState);
+    defer std.testing.allocator.destroy(state);
+    state.* = .{
+        .frame_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .fonts = undefined,
+        .ui_ctx = undefined,
+    };
+    state.initResources(&pctx);
+    defer state.deinitResources();
+
+    // Open `src/app/analysis.zig` (or first `.zig` file in workspace)
+    var zig_idx: usize = 0;
+    for (state.workspaceFiles(), 0..) |wf, idx| {
+        if (std.mem.eql(u8, wf.path, "src/app/analysis.zig")) {
+            zig_idx = idx;
+            break;
+        } else if (wf.language == .zig) {
+            zig_idx = idx;
+        }
+    }
+    state.openFile(zig_idx);
+    state.doc.show_sidebar = true;
+    state.doc.active_sidebar_view = 0;
+    state.doc.sec_open_editors = true;
+    state.doc.sec_files = false; // Collapse workspace tree so OUTLINE is prominently visible
+    state.doc.sec_outline = true;
+    state.doc.outline_group_fn = true;
+    state.doc.outline_group_types = true;
+
+    const canvas = surface.canvas();
+    _ = canvas.save();
+    canvas.scale(scale, scale);
+    pctx.canvas = canvas.ptr;
+    pctx.force_full_redraw = true;
+    const painted = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
+    canvas.restore();
+    try std.testing.expect(painted);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+
+    // Verify all cached symbols after full UI pass are valid ASCII identifiers and non-corrupted
+    const syms = state.symbolsForFile(zig_idx);
+    try std.testing.expect(syms.len > 0);
+    for (syms) |s| {
+        try std.testing.expect(s.name.len > 0);
+        try std.testing.expect(std.mem.eql(u8, s.kind, "fn") or std.mem.eql(u8, s.kind, "st") or std.mem.eql(u8, s.kind, "ct"));
+        for (s.name) |ch| {
+            try std.testing.expect(std.ascii.isAlphanumeric(ch) or ch == '_');
+        }
+    }
+
+    // Also render `src/app/views/explorer.zig` with `@` Go-to-Symbol Command Palette open
+    for (state.workspaceFiles(), 0..) |wf, idx| {
+        if (std.mem.eql(u8, wf.path, "src/app/views/explorer.zig")) {
+            zig_idx = idx;
+            break;
+        }
+    }
+    state.openFile(zig_idx);
+    state.doc.show_command_palette = true;
+    state.palette_query.set("@");
+    _ = canvas.save();
+    canvas.scale(scale, scale);
+    pctx.canvas = canvas.ptr;
+    pctx.force_full_redraw = true;
+    const painted_exp = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
+    canvas.restore();
+    try std.testing.expect(painted_exp);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+
+    const exp_syms = state.symbolsForFile(zig_idx);
+    try std.testing.expect(exp_syms.len > 0);
+    for (exp_syms) |s| {
+        try std.testing.expect(s.name.len > 0);
+        try std.testing.expect(std.mem.eql(u8, s.kind, "fn") or std.mem.eql(u8, s.kind, "st") or std.mem.eql(u8, s.kind, "ct"));
+        for (s.name) |ch| {
+            try std.testing.expect(std.ascii.isAlphanumeric(ch) or ch == '_');
+        }
+    }
+}
+
 test "Workbench Monkey-Tester: randomized command dispatch, split-pane topology invariants, and Pass.input == Pass.paint rect-count determinism" {
     const std = @import("std");
     const skia = @import("skia");

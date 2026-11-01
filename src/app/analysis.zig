@@ -42,8 +42,10 @@ fn toLspLanguage(lang: ui.CodeLanguage) ?lsp.LspLanguage {
 
 fn normalizeKind(raw: []const u8) []const u8 {
     if (std.mem.eql(u8, raw, "fn") or
+        std.mem.eql(u8, raw, "func") or
         std.mem.eql(u8, raw, "method") or
-        std.mem.eql(u8, raw, "task"))
+        std.mem.eql(u8, raw, "task") or
+        std.mem.eql(u8, raw, "proc"))
     {
         return "fn";
     }
@@ -52,6 +54,7 @@ fn normalizeKind(raw: []const u8) []const u8 {
         std.mem.eql(u8, raw, "enum") or
         std.mem.eql(u8, raw, "type") or
         std.mem.eql(u8, raw, "interface") or
+        std.mem.eql(u8, raw, "iface") or
         std.mem.eql(u8, raw, "record") or
         std.mem.eql(u8, raw, "union") or
         std.mem.eql(u8, raw, "trait") or
@@ -62,6 +65,7 @@ fn normalizeKind(raw: []const u8) []const u8 {
         std.mem.eql(u8, raw, "obj") or
         std.mem.eql(u8, raw, "node") or
         std.mem.eql(u8, raw, "ns") or
+        std.mem.eql(u8, raw, "pkg") or
         std.mem.eql(u8, raw, "mod") or
         std.mem.eql(u8, raw, "st"))
     {
@@ -78,7 +82,132 @@ fn normalizeKind(raw: []const u8) []const u8 {
     {
         return "ct";
     }
-    return raw;
+    return "st";
+}
+
+fn takeZigIdent(s: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < s.len and (std.ascii.isAlphanumeric(s[end]) or s[end] == '_')) : (end += 1) {}
+    return s[0..end];
+}
+
+fn isZigTypeRhs(rhs: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, rhs, " \t");
+    const type_kw = [_][]const u8{
+        "struct",
+        "packed struct",
+        "extern struct",
+        "enum",
+        "union",
+        "packed union",
+        "extern union",
+        "error{",
+        "error {",
+        "opaque",
+    };
+    for (type_kw) |kw| {
+        if (std.mem.startsWith(u8, trimmed, kw)) {
+            const after = trimmed[kw.len..];
+            if (after.len == 0 or !std.ascii.isAlphanumeric(after[0])) return true;
+        }
+    }
+    return false;
+}
+
+fn isPlainImportAliasRhs(rhs: []const u8) bool {
+    const trimmed = std.mem.trim(u8, rhs, " \t\r;");
+    if (trimmed.len == 0) return true;
+    if (std.mem.startsWith(u8, trimmed, "@import(") or std.mem.startsWith(u8, trimmed, "@cImport(")) return true;
+    // Check if `trimmed` is a simple dotted module/member alias like `platform.lsp` or `state_mod.EditorState`
+    var saw_dot = false;
+    for (trimmed) |ch| {
+        if (ch == '.') {
+            saw_dot = true;
+        } else if (!std.ascii.isAlphanumeric(ch) and ch != '_') {
+            return false;
+        }
+    }
+    return saw_dot;
+}
+
+fn extractZigSymbols(source: []const u8, out: []SymbolItem) usize {
+    var count: usize = 0;
+    var line_it = std.mem.splitScalar(u8, source, '\n');
+    var line_num: usize = 1;
+
+    while (line_it.next()) |raw_line| : (line_num += 1) {
+        if (count >= out.len) break;
+        const line_no_cr = std.mem.trimEnd(u8, raw_line, "\r");
+        const line = std.mem.trimStart(u8, line_no_cr, " \t");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "//") or std.mem.startsWith(u8, line, "\\\\")) continue;
+        const is_top_level = (line.len == line_no_cr.len);
+
+        const fn_prefixes = [_][]const u8{
+            "pub inline fn ",
+            "pub fn ",
+            "export fn ",
+            "inline fn ",
+            "fn ",
+        };
+        var matched_fn = false;
+        for (fn_prefixes) |pfx| {
+            if (std.mem.startsWith(u8, line, pfx)) {
+                const ident = takeZigIdent(std.mem.trimStart(u8, line[pfx.len..], " \t"));
+                if (ident.len > 0) {
+                    out[count] = .{ .kind = "fn", .name = ident, .line = line_num };
+                    count += 1;
+                    matched_fn = true;
+                }
+                break;
+            }
+        }
+        if (matched_fn) continue;
+
+        const decl_prefixes = [_]struct { pfx: []const u8, is_pub: bool }{
+            .{ .pfx = "pub const ", .is_pub = true },
+            .{ .pfx = "pub var ", .is_pub = true },
+            .{ .pfx = "const ", .is_pub = false },
+            .{ .pfx = "var ", .is_pub = false },
+        };
+        for (decl_prefixes) |dp| {
+            if (std.mem.startsWith(u8, line, dp.pfx)) {
+                const rest = std.mem.trimStart(u8, line[dp.pfx.len..], " \t");
+                const ident = takeZigIdent(rest);
+                if (ident.len == 0) break;
+
+                const after_ident = std.mem.trimStart(u8, rest[ident.len..], " \t");
+                const eq_pos = std.mem.indexOfScalar(u8, after_ident, '=');
+                const has_type_annot = (after_ident.len > 0 and after_ident[0] == ':');
+                const rhs = if (eq_pos) |ep|
+                    (if (ep + 1 < after_ident.len and after_ident[ep + 1] != '=') after_ident[ep + 1 ..] else "")
+                else
+                    "";
+
+                if (isZigTypeRhs(rhs)) {
+                    // Include public types, top-level types, and PascalCase container types (`const UndoSlot = struct`)
+                    if (dp.is_pub or is_top_level or std.ascii.isUpper(ident[0])) {
+                        out[count] = .{ .kind = "st", .name = ident, .line = line_num };
+                        count += 1;
+                    }
+                    break;
+                }
+
+                // Skip `@import` bindings and local variables inside function bodies
+                if (std.mem.indexOfPos(u8, rest, 0, "@import(") != null or
+                    std.mem.indexOfPos(u8, rest, 0, "@cImport(") != null)
+                {
+                    break;
+                }
+                if (!dp.is_pub and !is_top_level) break;
+                if (!dp.is_pub and !has_type_annot and isPlainImportAliasRhs(rhs)) break;
+
+                out[count] = .{ .kind = "ct", .name = ident, .line = line_num };
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
 }
 
 pub fn extractSymbols(source: []const u8, language: ui.CodeLanguage, out: []SymbolItem) usize {
@@ -104,15 +233,19 @@ pub fn extractSymbols(source: []const u8, language: ui.CodeLanguage, out: []Symb
         return count;
     }
 
+    if (language == .zig) {
+        return extractZigSymbols(source, out);
+    }
+
     const lsp_lang = toLspLanguage(language) orelse return 0;
-    var lsp_syms: [128]lsp.LspSymbol = undefined;
-    const lsp_count = lsp.scanSymbols(source, lsp_lang, "", &lsp_syms);
+    var lsp_syms: [128]lsp.LspSymbolSlice = undefined;
+    const lsp_count = lsp.scanSymbolSlices(source, lsp_lang, "", &lsp_syms);
     const n = @min(lsp_count, out.len);
     for (0..n) |i| {
-        const s = &lsp_syms[i];
+        const s = lsp_syms[i];
         out[i] = .{
-            .kind = normalizeKind(s.kind.slice()),
-            .name = s.name.slice(),
+            .kind = normalizeKind(s.kind),
+            .name = s.name,
             .line = s.line,
         };
     }
@@ -201,6 +334,17 @@ test "analysis: extractSymbols parses Zig and Markdown symbols" {
     ;
     var syms: [8]SymbolItem = undefined;
     const n = extractSymbols(zig_src, .zig, &syms);
+
+    // Clobber stack memory to ensure returned symbol slices never dangle into extractSymbols' stack frame
+    const clobberStack = struct {
+        noinline fn run() u8 {
+            var scratch: [32768]u8 = @splat(0xAA);
+            std.mem.doNotOptimizeAway(&scratch);
+            return scratch[1234];
+        }
+    }.run;
+    try std.testing.expectEqual(@as(u8, 0xAA), clobberStack());
+
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqualStrings("st", syms[0].kind);
     try std.testing.expectEqualStrings("Config", syms[0].name);
@@ -209,6 +353,12 @@ test "analysis: extractSymbols parses Zig and Markdown symbols" {
     try std.testing.expectEqualStrings("MAX_ITEMS", syms[1].name);
     try std.testing.expectEqualStrings("fn", syms[2].kind);
     try std.testing.expectEqualStrings("computeLayout", syms[2].name);
+    for (syms[0..n]) |s| {
+        const name_addr = @intFromPtr(s.name.ptr);
+        const src_start = @intFromPtr(zig_src.ptr);
+        const src_end = src_start + zig_src.len;
+        try std.testing.expect(name_addr >= src_start and name_addr + s.name.len <= src_end);
+    }
 
     const md_src = "# Overview\n## Architecture\n### Details\n";
     const md_n = extractSymbols(md_src, .markdown, &syms);

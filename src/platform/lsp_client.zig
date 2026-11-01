@@ -260,6 +260,21 @@ pub const LspSymbol = struct {
     line: u32 = 1, // 1-based line number
 };
 
+pub const LspSymbolSlice = struct {
+    kind: []const u8 = "",
+    name: []const u8 = "",
+    detail: []const u8 = "",
+    line: u32 = 1, // 1-based line number
+
+    pub fn toOwned(self: LspSymbolSlice) LspSymbol {
+        var sym = LspSymbol{ .line = self.line };
+        sym.kind.set(self.kind);
+        sym.name.set(self.name);
+        sym.detail.set(self.detail);
+        return sym;
+    }
+};
+
 pub const LspCompletionItem = struct {
     label: InlineString(40) = .{},
     detail: InlineString(40) = .{},
@@ -1382,7 +1397,49 @@ fn takeIdent(s: []const u8) []const u8 {
     return std.mem.trimEnd(u8, s[0..end], ":");
 }
 
-/// Extracts functions, methods, classes, structs, interfaces, and packages from C/C++, Java, or Go source code.
+/// Zero-copy symbol scanner that returns slices pointing directly into `source` (and static literals for `kind`/`detail`).
+pub fn scanSymbolSlices(source: []const u8, lang: LspLanguage, filter: []const u8, out: []LspSymbolSlice) usize {
+    var count: usize = 0;
+    var line_it = std.mem.splitScalar(u8, source, '\n');
+    var line_num: u32 = 1;
+
+    while (line_it.next()) |raw_line| : (line_num += 1) {
+        if (count >= out.len) break;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or
+            std.mem.startsWith(u8, line, "//") or
+            std.mem.startsWith(u8, line, "/*") or
+            std.mem.startsWith(u8, line, "*") or
+            (lang == .python and std.mem.startsWith(u8, line, "#")) or
+            (lang == .hdl and std.mem.startsWith(u8, line, "--")))
+        {
+            continue;
+        }
+
+        const sym_opt: ?LspSymbolSlice = switch (lang) {
+            .cpp => parseCppSymbolLine(line, line_num),
+            .java => parseJavaSymbolLine(line, line_num),
+            .go => parseGoSymbolLine(line, line_num),
+            .systemverilog => parseSvSymbolLine(line, line_num),
+            .zig => parseZigSymbolLine(line, line_num),
+            .rust => parseRustSymbolLine(line, line_num),
+            .python => parsePythonSymbolLine(line, line_num),
+            .typescript => parseTsSymbolLine(line, line_num),
+            .hdl => parseHdlSymbolLine(line, line_num),
+        };
+
+        if (sym_opt) |sym| {
+            if (filter.len > 0 and !containsIgnoreCase(sym.name, filter) and !containsIgnoreCase(sym.kind, filter)) {
+                continue;
+            }
+            out[count] = sym;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// Extracts functions, methods, classes, structs, interfaces, and packages into owned `LspSymbol` structs.
 pub fn scanSymbols(source: []const u8, lang: LspLanguage, filter: []const u8, out: []LspSymbol) usize {
     var count: usize = 0;
     var line_it = std.mem.splitScalar(u8, source, '\n');
@@ -1401,24 +1458,23 @@ pub fn scanSymbols(source: []const u8, lang: LspLanguage, filter: []const u8, ou
             continue;
         }
 
-        var sym_opt: ?LspSymbol = null;
-        switch (lang) {
-            .cpp => sym_opt = parseCppSymbolLine(line, line_num),
-            .java => sym_opt = parseJavaSymbolLine(line, line_num),
-            .go => sym_opt = parseGoSymbolLine(line, line_num),
-            .systemverilog => sym_opt = parseSvSymbolLine(line, line_num),
-            .zig => sym_opt = parseZigSymbolLine(line, line_num),
-            .rust => sym_opt = parseRustSymbolLine(line, line_num),
-            .python => sym_opt = parsePythonSymbolLine(line, line_num),
-            .typescript => sym_opt = parseTsSymbolLine(line, line_num),
-            .hdl => sym_opt = parseHdlSymbolLine(line, line_num),
-        }
+        const sym_opt: ?LspSymbolSlice = switch (lang) {
+            .cpp => parseCppSymbolLine(line, line_num),
+            .java => parseJavaSymbolLine(line, line_num),
+            .go => parseGoSymbolLine(line, line_num),
+            .systemverilog => parseSvSymbolLine(line, line_num),
+            .zig => parseZigSymbolLine(line, line_num),
+            .rust => parseRustSymbolLine(line, line_num),
+            .python => parsePythonSymbolLine(line, line_num),
+            .typescript => parseTsSymbolLine(line, line_num),
+            .hdl => parseHdlSymbolLine(line, line_num),
+        };
 
         if (sym_opt) |sym| {
-            if (filter.len > 0 and !containsIgnoreCase(sym.name.slice(), filter) and !containsIgnoreCase(sym.kind.slice(), filter)) {
+            if (filter.len > 0 and !containsIgnoreCase(sym.name, filter) and !containsIgnoreCase(sym.kind, filter)) {
                 continue;
             }
-            out[count] = sym;
+            out[count] = sym.toOwned();
             count += 1;
         }
     }
@@ -1435,7 +1491,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn parseCppSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseCppSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const prefixes = [_]struct { pfx: []const u8, kind: []const u8 }{
         .{ .pfx = "namespace ", .kind = "ns" },
         .{ .pfx = "class ", .kind = "class" },
@@ -1448,11 +1504,12 @@ fn parseCppSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         if (std.mem.startsWith(u8, line, p.pfx)) {
             const ident = takeIdent(std.mem.trimStart(u8, line[p.pfx.len..], " \t"));
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(p.kind);
-                sym.name.set(ident);
-                sym.detail.set("C/C++ type");
-                return sym;
+                return .{
+                    .kind = p.kind,
+                    .name = ident,
+                    .detail = "C/C++ type",
+                    .line = line_num,
+                };
             }
         }
     }
@@ -1477,26 +1534,28 @@ fn parseCppSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         const space_idx = std.mem.lastIndexOfAny(u8, before, " \t*&") orelse return null;
         const fn_name = std.mem.trimStart(u8, before[space_idx + 1 ..], " \t*&");
         if (fn_name.len > 0 and (std.ascii.isAlphabetic(fn_name[0]) or fn_name[0] == '_' or fn_name[0] == '~')) {
-            var sym = LspSymbol{ .line = line_num };
-            sym.kind.set(if (std.mem.indexOfPos(u8, fn_name, 0, "::") != null) "method" else "fn");
-            sym.name.set(fn_name);
             const ret_type = std.mem.trim(u8, before[0..space_idx], " \t");
-            sym.detail.set(ret_type);
-            return sym;
+            return .{
+                .kind = if (std.mem.indexOfPos(u8, fn_name, 0, "::") != null) "method" else "fn",
+                .name = fn_name,
+                .detail = ret_type,
+                .line = line_num,
+            };
         }
     }
     return null;
 }
 
-fn parseJavaSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseJavaSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     if (std.mem.startsWith(u8, line, "package ")) {
         const pkg = std.mem.trim(u8, line["package ".len..], " ;\t\r");
         if (pkg.len > 0) {
-            var sym = LspSymbol{ .line = line_num };
-            sym.kind.set("pkg");
-            sym.name.set(pkg);
-            sym.detail.set("package");
-            return sym;
+            return .{
+                .kind = "pkg",
+                .name = pkg,
+                .detail = "package",
+                .line = line_num,
+            };
         }
     }
 
@@ -1512,11 +1571,12 @@ fn parseJavaSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
                 const rest = std.mem.trimStart(u8, line[pos + tt.token.len ..], " \t");
                 const ident = takeIdent(rest);
                 if (ident.len > 0) {
-                    var sym = LspSymbol{ .line = line_num };
-                    sym.kind.set(tt.kind);
-                    sym.name.set(ident);
-                    sym.detail.set("Java type");
-                    return sym;
+                    return .{
+                        .kind = tt.kind,
+                        .name = ident,
+                        .detail = "Java type",
+                        .line = line_num,
+                    };
                 }
             }
         }
@@ -1541,25 +1601,27 @@ fn parseJavaSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         const space_idx = std.mem.lastIndexOfScalar(u8, before, ' ') orelse return null;
         const method_name = before[space_idx + 1 ..];
         if (method_name.len > 0 and (std.ascii.isAlphabetic(method_name[0]) or method_name[0] == '_')) {
-            var sym = LspSymbol{ .line = line_num };
-            sym.kind.set("method");
-            sym.name.set(method_name);
-            sym.detail.set(std.mem.trim(u8, before[0..space_idx], " \t"));
-            return sym;
+            return .{
+                .kind = "method",
+                .name = method_name,
+                .detail = std.mem.trim(u8, before[0..space_idx], " \t"),
+                .line = line_num,
+            };
         }
     }
     return null;
 }
 
-fn parseGoSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseGoSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     if (std.mem.startsWith(u8, line, "package ")) {
         const pkg = takeIdent(std.mem.trimStart(u8, line["package ".len..], " \t"));
         if (pkg.len > 0) {
-            var sym = LspSymbol{ .line = line_num };
-            sym.kind.set("pkg");
-            sym.name.set(pkg);
-            sym.detail.set("package");
-            return sym;
+            return .{
+                .kind = "pkg",
+                .name = pkg,
+                .detail = "package",
+                .line = line_num,
+            };
         }
     }
 
@@ -1574,11 +1636,12 @@ fn parseGoSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         }
         const ident = takeIdent(rest);
         if (ident.len > 0) {
-            var sym = LspSymbol{ .line = line_num };
-            sym.kind.set(if (receiver_detail.len > 4) "method" else "func");
-            sym.name.set(ident);
-            sym.detail.set(receiver_detail);
-            return sym;
+            return .{
+                .kind = if (receiver_detail.len > 4) "method" else "func",
+                .name = ident,
+                .detail = receiver_detail,
+                .line = line_num,
+            };
         }
     }
 
@@ -1586,20 +1649,21 @@ fn parseGoSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         const rest = std.mem.trimStart(u8, line["type ".len..], " \t");
         const ident = takeIdent(rest);
         if (ident.len > 0) {
-            var sym = LspSymbol{ .line = line_num };
             const is_iface = std.mem.indexOfPos(u8, rest, 0, "interface") != null;
             const is_struct = std.mem.indexOfPos(u8, rest, 0, "struct") != null;
-            sym.kind.set(if (is_iface) "iface" else if (is_struct) "struct" else "type");
-            sym.name.set(ident);
-            sym.detail.set(if (is_iface) "interface" else if (is_struct) "struct" else "type alias");
-            return sym;
+            return .{
+                .kind = if (is_iface) "iface" else if (is_struct) "struct" else "type",
+                .name = ident,
+                .detail = if (is_iface) "interface" else if (is_struct) "struct" else "type alias",
+                .line = line_num,
+            };
         }
     }
 
     return null;
 }
 
-fn parseSvSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseSvSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const decl_prefixes = [_]struct { pfx: []const u8, kind: []const u8, detail: []const u8 }{
         .{ .pfx = "module ", .kind = "module", .detail = "SystemVerilog module" },
         .{ .pfx = "interface ", .kind = "iface", .detail = "SV interface" },
@@ -1627,11 +1691,12 @@ fn parseSvSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
             }
             const ident = takeIdent(rest);
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(dp.kind);
-                sym.name.set(ident);
-                sym.detail.set(dp.detail);
-                return sym;
+                return .{
+                    .kind = dp.kind,
+                    .name = ident,
+                    .detail = dp.detail,
+                    .line = line_num,
+                };
             }
         }
     }
@@ -1660,38 +1725,41 @@ fn parseSvSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
             }
             const ident = takeIdent(rest);
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set("sig");
-                sym.name.set(ident);
-                sym.detail.set(sp.detail);
-                return sym;
+                return .{
+                    .kind = "sig",
+                    .name = ident,
+                    .detail = sp.detail,
+                    .line = line_num,
+                };
             }
         }
     }
 
     if (std.mem.startsWith(u8, line, "always_ff") or std.mem.startsWith(u8, line, "always_comb") or std.mem.startsWith(u8, line, "always_latch")) {
         const proc_name = takeIdent(line);
-        var sym = LspSymbol{ .line = line_num };
-        sym.kind.set("proc");
-        sym.name.set(proc_name);
-        sym.detail.set("RTL process block");
-        return sym;
+        return .{
+            .kind = "proc",
+            .name = proc_name,
+            .detail = "RTL process block",
+            .line = line_num,
+        };
     }
 
     return null;
 }
 
-fn parseZigSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseZigSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const fn_prefixes = [_][]const u8{ "pub fn ", "export fn ", "fn " };
     for (fn_prefixes) |pfx| {
         if (std.mem.startsWith(u8, line, pfx)) {
             const ident = takeIdent(std.mem.trimStart(u8, line[pfx.len..], " \t"));
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set("fn");
-                sym.name.set(ident);
-                sym.detail.set("Zig function");
-                return sym;
+                return .{
+                    .kind = "fn",
+                    .name = ident,
+                    .detail = "Zig function",
+                    .line = line_num,
+                };
             }
         }
     }
@@ -1703,18 +1771,19 @@ fn parseZigSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
             if (ident.len > 0) {
                 const is_struct = std.mem.indexOfPos(u8, rest, 0, "struct") != null;
                 const is_enum = std.mem.indexOfPos(u8, rest, 0, "enum") != null;
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(if (is_struct) "struct" else if (is_enum) "enum" else "const");
-                sym.name.set(ident);
-                sym.detail.set(if (is_struct or is_enum) "Zig type" else "Zig binding");
-                return sym;
+                return .{
+                    .kind = if (is_struct) "struct" else if (is_enum) "enum" else "const",
+                    .name = ident,
+                    .detail = if (is_struct or is_enum) "Zig type" else "Zig binding",
+                    .line = line_num,
+                };
             }
         }
     }
     return null;
 }
 
-fn parseRustSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseRustSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const prefixes = [_]struct { pfx: []const u8, kind: []const u8, detail: []const u8 }{
         .{ .pfx = "pub async fn ", .kind = "fn", .detail = "async Rust fn" },
         .{ .pfx = "async fn ", .kind = "fn", .detail = "async Rust fn" },
@@ -1734,18 +1803,19 @@ fn parseRustSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         if (std.mem.startsWith(u8, line, p.pfx)) {
             const ident = takeIdent(std.mem.trimStart(u8, line[p.pfx.len..], " \t"));
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(p.kind);
-                sym.name.set(ident);
-                sym.detail.set(p.detail);
-                return sym;
+                return .{
+                    .kind = p.kind,
+                    .name = ident,
+                    .detail = p.detail,
+                    .line = line_num,
+                };
             }
         }
     }
     return null;
 }
 
-fn parsePythonSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parsePythonSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const prefixes = [_]struct { pfx: []const u8, kind: []const u8, detail: []const u8 }{
         .{ .pfx = "async def ", .kind = "fn", .detail = "async Python def" },
         .{ .pfx = "def ", .kind = "fn", .detail = "Python def" },
@@ -1755,18 +1825,19 @@ fn parsePythonSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         if (std.mem.startsWith(u8, line, p.pfx)) {
             const ident = takeIdent(std.mem.trimStart(u8, line[p.pfx.len..], " \t"));
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(p.kind);
-                sym.name.set(ident);
-                sym.detail.set(p.detail);
-                return sym;
+                return .{
+                    .kind = p.kind,
+                    .name = ident,
+                    .detail = p.detail,
+                    .line = line_num,
+                };
             }
         }
     }
     return null;
 }
 
-fn parseTsSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseTsSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const prefixes = [_]struct { pfx: []const u8, kind: []const u8, detail: []const u8 }{
         .{ .pfx = "export async function ", .kind = "fn", .detail = "async TS function" },
         .{ .pfx = "export function ", .kind = "fn", .detail = "TS function" },
@@ -1783,18 +1854,19 @@ fn parseTsSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         if (std.mem.startsWith(u8, line, p.pfx)) {
             const ident = takeIdent(std.mem.trimStart(u8, line[p.pfx.len..], " \t"));
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(p.kind);
-                sym.name.set(ident);
-                sym.detail.set(p.detail);
-                return sym;
+                return .{
+                    .kind = p.kind,
+                    .name = ident,
+                    .detail = p.detail,
+                    .line = line_num,
+                };
             }
         }
     }
     return null;
 }
 
-fn parseHdlSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
+fn parseHdlSymbolLine(line: []const u8, line_num: u32) ?LspSymbolSlice {
     const prefixes = [_]struct { pfx: []const u8, kind: []const u8, detail: []const u8 }{
         .{ .pfx = "entity ", .kind = "entity", .detail = "VHDL entity" },
         .{ .pfx = "architecture ", .kind = "arch", .detail = "VHDL architecture" },
@@ -1807,11 +1879,12 @@ fn parseHdlSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
         if (std.mem.startsWith(u8, line, p.pfx)) {
             const ident = takeIdent(std.mem.trimStart(u8, line[p.pfx.len..], " \t"));
             if (ident.len > 0) {
-                var sym = LspSymbol{ .line = line_num };
-                sym.kind.set(p.kind);
-                sym.name.set(ident);
-                sym.detail.set(p.detail);
-                return sym;
+                return .{
+                    .kind = p.kind,
+                    .name = ident,
+                    .detail = p.detail,
+                    .line = line_num,
+                };
             }
         }
     }
@@ -1819,11 +1892,12 @@ fn parseHdlSymbolLine(line: []const u8, line_num: u32) ?LspSymbol {
     if (std.mem.endsWith(u8, line, "{") and !std.mem.startsWith(u8, line, "/")) {
         const node_head = std.mem.trim(u8, line[0 .. line.len - 1], " \t");
         if (node_head.len > 0) {
-            var sym = LspSymbol{ .line = line_num };
-            sym.kind.set("node");
-            sym.name.set(node_head);
-            sym.detail.set("DeviceTree node");
-            return sym;
+            return .{
+                .kind = "node",
+                .name = node_head,
+                .detail = "DeviceTree node",
+                .line = line_num,
+            };
         }
     }
     return null;

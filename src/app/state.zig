@@ -302,7 +302,9 @@ pub const EditorState = struct {
     pending_md_heading: platform.InlineString(128) = .{},
 
     // Version-memoized symbol outline & diagnostics caches (O(1) on frames without buffer edits)
-    cached_symbols: [32]SymbolItem = undefined,
+    cached_symbols: [128]SymbolItem = undefined,
+    cached_symbol_names: [128]platform.InlineString(64) = @splat(.{}),
+    cached_symbol_kinds: [128]platform.InlineString(12) = @splat(.{}),
     cached_symbol_count: usize = 0,
     cached_symbol_file: usize = std.math.maxInt(usize),
     cached_symbol_version: u32 = 0,
@@ -805,6 +807,22 @@ pub const EditorState = struct {
         return true;
     }
 
+    fn bindCachedSymbolSlices(self: *EditorState) []const SymbolItem {
+        for (0..self.cached_symbol_count) |i| {
+            self.cached_symbols[i].kind = self.cached_symbol_kinds[i].slice();
+            self.cached_symbols[i].name = self.cached_symbol_names[i].slice();
+        }
+        return self.cached_symbols[0..self.cached_symbol_count];
+    }
+
+    fn copyExtractedSymbolsToCache(self: *EditorState, count: usize) void {
+        self.cached_symbol_count = count;
+        for (0..count) |i| {
+            self.cached_symbol_kinds[i].set(self.cached_symbols[i].kind);
+            self.cached_symbol_names[i].set(self.cached_symbols[i].name);
+        }
+    }
+
     /// Returns the symbol outline for `file_idx`, memoized by `(file_idx, buf.edit_version)` so
     /// frames without edits do zero source scanning.
     pub fn symbolsForFile(self: *EditorState, file_idx: usize) []const SymbolItem {
@@ -814,11 +832,12 @@ pub const EditorState = struct {
         if (wfs[raw_clamped].is_markdown_preview and self.isScratchMarkdownPreview(raw_clamped)) {
             const buf = &self.scratch_buf;
             if (self.cached_symbol_file != 0xFFFF or self.cached_symbol_version != buf.edit_version) {
-                self.cached_symbol_count = analysis.extractSymbols(buf.slice(), .markdown, &self.cached_symbols);
+                const count = analysis.extractSymbols(buf.slice(), .markdown, &self.cached_symbols);
+                self.copyExtractedSymbolsToCache(count);
                 self.cached_symbol_file = 0xFFFF;
                 self.cached_symbol_version = buf.edit_version;
             }
-            return self.cached_symbols[0..self.cached_symbol_count];
+            return self.bindCachedSymbolSlices();
         }
         const clamped = if (wfs[raw_clamped].is_markdown_preview)
             self.markdownPreviewSourceIndexForBuffer(raw_clamped)
@@ -833,11 +852,12 @@ pub const EditorState = struct {
         self.ensureFileLoaded(clamped);
         const buf = &self.buffers[clamped];
         if (self.cached_symbol_file != clamped or self.cached_symbol_version != buf.edit_version) {
-            self.cached_symbol_count = analysis.extractSymbols(buf.slice(), wfs[clamped].language, &self.cached_symbols);
+            const count = analysis.extractSymbols(buf.slice(), wfs[clamped].language, &self.cached_symbols);
+            self.copyExtractedSymbolsToCache(count);
             self.cached_symbol_file = clamped;
             self.cached_symbol_version = buf.edit_version;
         }
-        return self.cached_symbols[0..self.cached_symbol_count];
+        return self.bindCachedSymbolSlices();
     }
 
     /// Returns diagnostics for `file_idx`, memoized by `(file_idx, buf.edit_version)` so
