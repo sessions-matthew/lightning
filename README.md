@@ -1,8 +1,12 @@
 # Lightning Editor
 
+[![Discord - Zig LLM Group](https://img.shields.io/badge/Discord-Zig%20LLM%20Group-5865F2?logo=discord&logoColor=white)](https://discord.gg/qs5gbtg28H)
+
 **Lightning** is a fast, native code editor written in **Zig 0.17.0** and rendered with **Skia** over **Metal** (macOS), **Win32** (Windows), and **Wayland/X11** (Linux).
 
 Its interface combines the workbench layout of **VS Code** (activity bar, file explorer, docked split panes, Command Palette) with the buffer-centric workflow of **Emacs** (per-window interactive mode lines, `*scratch*` buffers, and side-by-side terminal/agent/preview buffers).
+
+> **Community**: Join the [**Zig LLM Group** Discord server](https://discord.gg/qs5gbtg28H) to discuss Lightning, Zig tooling, and AI agent workflows.
 
 ---
 
