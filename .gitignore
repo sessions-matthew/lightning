@@ -1,0 +1,18 @@
+# Zig build outputs & cache
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Operating System files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+
+# Editor / IDE artifacts
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
