@@ -124,6 +124,10 @@ pub fn clearImageCache() void {
 }
 
 pub fn isImagePath(path: []const u8) bool {
+    if (path.len < 4) return false;
+    const has_dot4 = (path[path.len - 4] == '.');
+    const has_dot5 = (path.len >= 5 and path[path.len - 5] == '.');
+    if (!has_dot4 and !has_dot5) return false;
     const exts = [_][]const u8{
         ".png",  ".jpg",  ".jpeg", ".gif",  ".webp", ".bmp",
         ".ico",  ".wbmp", ".svg",  ".ppm",  ".pgm",  ".pbm",

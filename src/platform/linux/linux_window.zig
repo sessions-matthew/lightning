@@ -547,6 +547,9 @@ pub fn run(config: Config) !void {
         metrics_collector.deinit();
     }
 
+    var debug_server = profiler.LiveDebugServer.init(std.heap.c_allocator);
+    defer debug_server.deinit();
+
     const scenario = if (config.scenario) |s| profiler.ScenarioKind.fromString(s) else .none;
     const effective_max_frames: ?usize = config.max_frames orelse if (config.bench) 300 else null;
 
@@ -835,6 +838,10 @@ pub fn run(config: Config) !void {
         const events_ns = t_events_end - t_events_start;
         trace_collector.record("Linux.Events", "event", t_events_start, t_events_end);
 
+        if (debug_server.poll(&ctx, &metrics_collector, &trace_collector)) {
+            redraw_frames_remaining = @max(redraw_frames_remaining, 2);
+        }
+
         if (event_state.quit_requested) break;
         if (effective_max_frames) |limit| {
             if (ctx.frame_count >= limit) break;
@@ -926,6 +933,7 @@ pub fn run(config: Config) !void {
         }
 
         if (!did_paint and effective_max_frames == null) {
+            metrics_collector.recordIdleWakeup(&ctx);
             last_frame_ns = profiler.nowNs();
             continue;
         }

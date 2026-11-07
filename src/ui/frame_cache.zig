@@ -14,8 +14,8 @@ pub const Pass = layout_mod.Pass;
 pub const WaveformData = waveform_mod.WaveformData;
 pub const PdfDocumentData = pdf_viewer_mod.PdfDocumentData;
 
-pub const MaxLatchSlots = 64;
-pub const MaxFrameCacheSlots = 32;
+pub const MaxLatchSlots = 512;
+pub const MaxFrameCacheSlots = 64;
 pub const PreviewCacheWays = 4;
 
 /// Per-frame sequential value tape that records scalar/small values (`bool`, integers, enums, floats

@@ -2211,7 +2211,7 @@ pub fn render(
 
         // Pre-populate exact scroll content height so `scroll_to_cursor_pending` (e.g. `jumpToLine`)
         // is never clamped to 0 on the first frame before `endScrollBox` runs.
-        const exact_content_h = pad_top + computeLineY(editor, @max(1, editor.lineCount()), options.line_height, options.word_wrap, max_chars_per_line) + 16.0;
+        const exact_content_h = computeLineY(editor, @max(1, editor.lineCount()), options.line_height, options.word_wrap, max_chars_per_line);
         if (scroll_state.content_height < exact_content_h) {
             scroll_state.content_height = exact_content_h;
         }

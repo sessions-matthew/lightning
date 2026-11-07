@@ -27,6 +27,8 @@ pub const waveform_mod = @import("waveform.zig");
 pub const diff_viewer_mod = @import("diff_viewer.zig");
 pub const pdf_viewer_mod = @import("pdf_viewer.zig");
 pub const image_viewer_mod = @import("image_viewer.zig");
+pub const audio_player_mod = @import("audio_player.zig");
+pub const video_player_mod = @import("video_player.zig");
 pub const app_runner_mod = @import("app_runner.zig");
 pub const dock_mod = @import("dock.zig");
 pub const frame_cache_mod = @import("frame_cache.zig");
@@ -39,6 +41,7 @@ pub const data_grid_mod = @import("data_grid.zig");
 pub const charts_mod = @import("charts.zig");
 pub const node_graph_mod = @import("node_graph.zig");
 pub const tree_view_mod = @import("tree_view.zig");
+pub const app_simulator_mod = @import("app_simulator.zig");
 
 pub const Theme = theme_mod.Theme;
 pub const Pass = layout_mod.Pass;
@@ -104,6 +107,31 @@ pub const SAMPLE_SVG_IMAGE = image_viewer_mod.SAMPLE_SVG_IMAGE;
 pub const isImagePath = image_viewer_mod.isImagePath;
 pub const queryImageDimensions = image_viewer_mod.queryImageDimensions;
 pub const drawImageThumbnail = image_viewer_mod.drawImageThumbnail;
+pub const AudioVisualizerMode = audio_player_mod.AudioVisualizerMode;
+pub const AudioMetadata = audio_player_mod.AudioMetadata;
+pub const AudioPlayerState = audio_player_mod.AudioPlayerState;
+pub const AudioPlayerOptions = audio_player_mod.AudioPlayerOptions;
+pub const AudioPlayerResult = audio_player_mod.AudioPlayerResult;
+pub const isAudioPath = audio_player_mod.isAudioPath;
+pub const detectAudioFormatBadge = audio_player_mod.detectAudioFormatBadge;
+pub const SAMPLE_WAV_BYTES_LEN = audio_player_mod.SAMPLE_WAV_BYTES_LEN;
+pub const generateSampleWav = audio_player_mod.generateSampleWav;
+pub const VideoAspectRatio = video_player_mod.VideoAspectRatio;
+pub const VideoMetadata = video_player_mod.VideoMetadata;
+pub const VideoPlayerState = video_player_mod.VideoPlayerState;
+pub const VideoPlayerOptions = video_player_mod.VideoPlayerOptions;
+pub const VideoPlayerResult = video_player_mod.VideoPlayerResult;
+pub const isVideoPath = video_player_mod.isVideoPath;
+pub const detectVideoFormatBadge = video_player_mod.detectVideoFormatBadge;
+pub const SAMPLE_MP4_HEADER_SIZE = video_player_mod.SAMPLE_MP4_HEADER_SIZE;
+pub const generateSampleMp4Header = video_player_mod.generateSampleMp4Header;
+pub const DevicePreset = app_simulator_mod.DevicePreset;
+pub const Orientation = app_simulator_mod.Orientation;
+pub const DeviceCategory = app_simulator_mod.DeviceCategory;
+pub const AppSimulatorState = app_simulator_mod.AppSimulatorState;
+pub const AppSimulatorOptions = app_simulator_mod.AppSimulatorOptions;
+pub const AppSimulatorResult = app_simulator_mod.AppSimulatorResult;
+pub const renderAppSimulator = app_simulator_mod.renderAppSimulator;
 pub const FontSizes = app_runner_mod.FontSizes;
 pub const FontSet = app_runner_mod.FontSet;
 pub const runTwoPhaseFrame = app_runner_mod.runTwoPhaseFrame;
@@ -204,6 +232,7 @@ pub const fuzzyScore = command_registry_mod.fuzzyScore;
 pub const scoreCommandMatch = command_registry_mod.scoreCommandMatch;
 pub const matchesCommandQuery = command_registry_mod.matchesCommandQuery;
 pub const Shortcut = command_registry_mod.Shortcut;
+pub const KeyChord = command_registry_mod.KeyChord;
 pub const CommandEntry = command_registry_mod.CommandEntry;
 pub const matchShortcutInTable = command_registry_mod.matchShortcutInTable;
 pub const keyCodeDisplayName = command_registry_mod.keyCodeDisplayName;
@@ -896,8 +925,10 @@ pub const Context = struct {
 
     /// Computes the visible index slice `[first, end)` and top/bottom `spacer` heights for a uniform
     /// vertical list of `item_count` rows with step `item_step_y` inside the active scroll viewport.
+    /// Automatically latches the computed range across `Pass.input` and `Pass.paint` to preserve
+    /// strict two-phase layout rect-count determinism even if scroll state is clamped at end-of-pass.
     pub fn computeVirtualRange(
-        self: *const Context,
+        self: *Context,
         item_count: usize,
         item_step_y: f32,
         overscan: usize,
@@ -914,13 +945,20 @@ pub const Context = struct {
             @min(item_count, @as(usize, @intFromFloat(@floor(rel_top / item_step_y))))
         else
             0;
-        const first: usize = raw_first -| overscan;
+        var first: usize = raw_first -| overscan;
 
         const raw_end: usize = if (rel_bottom > 0.0)
             @min(item_count, @as(usize, @intFromFloat(@ceil(rel_bottom / item_step_y))))
         else
             0;
-        const end: usize = @min(item_count, @max(first, raw_end + overscan));
+        var end: usize = @min(item_count, @max(first, raw_end + overscan));
+        if (first == end) {
+            if (first > 0) {
+                first -= 1;
+            } else {
+                end = 1;
+            }
+        }
 
         const container_gap: f32 = if (self.stack_len > 0 and self.stack[self.stack_len - 1].direction == .column)
             self.stack[self.stack_len - 1].gap
@@ -937,11 +975,18 @@ pub const Context = struct {
         else
             0.0;
 
+        const latched_first = self.latch(usize, first);
+        const latched_end = self.latch(usize, end);
+        const latched_top = self.latch(f32, top_spacer_h);
+        const latched_bottom = self.latch(f32, bottom_spacer_h);
+        const safe_end = @min(item_count, latched_end);
+        const safe_first = @min(safe_end, latched_first);
+
         return .{
-            .first = first,
-            .end = end,
-            .top_spacer_h = top_spacer_h,
-            .bottom_spacer_h = bottom_spacer_h,
+            .first = safe_first,
+            .end = safe_end,
+            .top_spacer_h = latched_top,
+            .bottom_spacer_h = latched_bottom,
         };
     }
 
@@ -1106,8 +1151,10 @@ pub const Context = struct {
         const compact_strip = (rect.bottom - rect.top) <= 40.0;
         const allow_h_scroll = style.allow_h_scroll;
 
-        const v_scrollbar_gutter: f32 = if (!compact_strip and scroll_state.content_height > raw_viewport_h + 0.5) 8.0 else 0.0;
-        const h_scrollbar_gutter: f32 = if (allow_h_scroll and !compact_strip and scroll_state.content_width > raw_viewport_w + 0.5) 8.0 else 0.0;
+        const raw_v_scrollbar_gutter: f32 = if (!compact_strip and scroll_state.content_height > raw_viewport_h + 0.5) 8.0 else 0.0;
+        const raw_h_scrollbar_gutter: f32 = if (allow_h_scroll and !compact_strip and scroll_state.content_width > raw_viewport_w + 0.5) 8.0 else 0.0;
+        const v_scrollbar_gutter = self.latch(f32, raw_v_scrollbar_gutter);
+        const h_scrollbar_gutter = self.latch(f32, raw_h_scrollbar_gutter);
 
         const viewport_w = @max(1.0, raw_viewport_w - v_scrollbar_gutter);
         const viewport_h = @max(1.0, raw_viewport_h - h_scrollbar_gutter);
@@ -2331,16 +2378,24 @@ pub const Context = struct {
 
         const has_action = (action_label.len > 0);
         const act_wid = resolved.wid ^ 0x5EC7_104A_C701;
-        const bw = if (badge_text.len > 0) self.measureTextCached(self.font_mono, badge_text) else 0.0;
+        const should_paint = self.shouldPaint(r);
+        const row_hovered = if (self.pass == .input) self.isHovered(r) else false;
+        const need_act_geom = has_action and
+            (should_paint or row_hovered or self.prev_hot_id == act_wid or self.prev_active_id == act_wid);
+
+        const bw = if (badge_text.len > 0 and (should_paint or need_act_geom))
+            self.measureTextCached(self.font_mono, badge_text)
+        else
+            0.0;
         const pill_w = if (badge_text.len > 0) @max(18.0, bw + 10.0) else 0.0;
         const act_right = if (badge_text.len > 0) r.right - pill_w - 8.0 else r.right - 4.0;
         const act_rect = Rect.xywh(act_right - 18.0, r.top + 3.0, 18.0, 18.0);
 
         var action_clicked = false;
-        if (has_action) {
+        if (need_act_geom) {
             action_clicked = self.trackInteraction(act_wid, act_rect, r);
         }
-        const over_action = (has_action and self.isHovered(act_rect));
+        const over_action = need_act_geom and self.isHovered(act_rect);
         const clicked = if (!action_clicked and !over_action)
             self.trackInteraction(resolved.wid, r, r)
         else
@@ -2353,13 +2408,13 @@ pub const Context = struct {
                 self.invalidateWindow();
             } else if (action_clicked) {
                 self.invalidateWindow();
-            } else if (self.right_mouse_pressed and self.isHovered(r)) {
+            } else if (self.right_mouse_pressed and row_hovered) {
                 right_clicked = true;
                 self.markDirty(r);
             }
         }
 
-        if (self.shouldPaint(r)) {
+        if (should_paint) {
             const hovered = (self.hot_id == resolved.wid or self.hot_id == act_wid);
             if (hovered) {
                 self.paint.setStyle(.fill);
@@ -3433,7 +3488,17 @@ pub const Context = struct {
         const act1_wid = resolved.wid ^ 0xA11C_7101_5EED;
         const act2_wid = resolved.wid ^ 0xA22C_7202_9EED;
 
-        const raw_meta_w: f32 = if (opts.meta.len > 0) self.measureTextCached(self.font_mono, opts.meta) else 0.0;
+        const should_paint = self.shouldPaint(r);
+        const row_hovered = if (self.pass == .input) self.isHovered(r) else false;
+        const need_action_geom = (has_act1 or has_act2) and
+            (should_paint or row_hovered or
+                self.prev_hot_id == act1_wid or self.prev_active_id == act1_wid or
+                self.prev_hot_id == act2_wid or self.prev_active_id == act2_wid);
+
+        const raw_meta_w: f32 = if (opts.meta.len > 0 and (should_paint or need_action_geom))
+            self.measureTextCached(self.font_mono, opts.meta)
+        else
+            0.0;
         const indent_px: f32 = @as(f32, @floatFromInt(opts.indent_level)) * 13.0;
         const base_text_x = r.left + indent_px + (if (opts.icon_text.len > 0) @as(f32, 28.0) else @as(f32, 10.0));
         const show_meta = (opts.meta.len > 0) and (base_text_x + 48.0 + raw_meta_w < r.right - 6.0);
@@ -3444,18 +3509,25 @@ pub const Context = struct {
         const act2_rect = Rect.xywh(act1_rect.left - btn_size - 3.0, btn_y, btn_size, btn_size);
 
         var res = ListItemResult{};
-        if (has_act1) {
-            res.action_clicked = self.trackInteraction(act1_wid, act1_rect, r);
+        if (need_action_geom) {
+            if (has_act1) {
+                res.action_clicked = self.trackInteraction(act1_wid, act1_rect, r);
+            }
+            if (has_act2) {
+                res.secondary_action_clicked = self.trackInteraction(act2_wid, act2_rect, r);
+            }
         }
-        if (has_act2) {
-            res.secondary_action_clicked = self.trackInteraction(act2_wid, act2_rect, r);
-        }
-        const over_actions = (has_act1 and self.isHovered(act1_rect)) or (has_act2 and self.isHovered(act2_rect));
+        const over_actions = need_action_geom and
+            ((has_act1 and self.isHovered(act1_rect)) or (has_act2 and self.isHovered(act2_rect)));
         if (!res.action_clicked and !res.secondary_action_clicked and !over_actions) {
             res.clicked = self.trackInteraction(resolved.wid, r, r);
+            if (self.pass == .input and self.right_mouse_pressed and row_hovered) {
+                res.right_clicked = true;
+                self.markDirty(r);
+            }
         }
 
-        if (self.shouldPaint(r)) {
+        if (should_paint) {
             const hovered = (self.hot_id == resolved.wid or self.hot_id == act1_wid or self.hot_id == act2_wid);
             if (opts.selected or hovered) {
                 self.paint.setStyle(.fill);
@@ -4946,6 +5018,43 @@ pub const Context = struct {
         return image_viewer_mod.renderImageViewer(self, widget_id_str, width, height, view, opts);
     }
 
+    /// Renders an interactive Two-Phase Audio Player (`AudioPlayerState`) with waveform visualizer,
+    /// spectrum bars, VU meters, timeline scrubber, and transport controls.
+    pub fn audioPlayer(
+        self: *Context,
+        widget_id_str: []const u8,
+        width: f32,
+        height: f32,
+        view: *AudioPlayerState,
+        opts: AudioPlayerOptions,
+    ) AudioPlayerResult {
+        return audio_player_mod.renderAudioPlayer(self, widget_id_str, width, height, view, opts);
+    }
+
+    /// Renders an interactive Two-Phase Video Player (`VideoPlayerState`) with aspect-ratio viewport,
+    /// frame extraction, timeline scrubber, frame stepping, and transport controls.
+    pub fn videoPlayer(
+        self: *Context,
+        widget_id_str: []const u8,
+        width: f32,
+        height: f32,
+        view: *VideoPlayerState,
+        opts: VideoPlayerOptions,
+    ) VideoPlayerResult {
+        return video_player_mod.renderVideoPlayer(self, widget_id_str, width, height, view, opts);
+    }
+
+    pub fn appSimulator(
+        self: *Context,
+        widget_id_str: []const u8,
+        width: f32,
+        height: f32,
+        sim: *AppSimulatorState,
+        opts: AppSimulatorOptions,
+    ) AppSimulatorResult {
+        return app_simulator_mod.renderAppSimulator(self, widget_id_str, width, height, sim, opts);
+    }
+
     // ========================================================================
     // Recursive Binary Split Tree & 5-Zone Docking (`splitTree` / `dock_mod`)
     // ========================================================================
@@ -5367,6 +5476,8 @@ test {
     _ = diff_viewer_mod;
     _ = pdf_viewer_mod;
     _ = image_viewer_mod;
+    _ = audio_player_mod;
+    _ = video_player_mod;
     _ = dock_mod;
     _ = virtual_list_mod;
     _ = cards_mod;
@@ -6362,5 +6473,52 @@ test "ui.Context: latch and useFrameCache preserve two-phase determinism across 
     try std.testing.expect(pa_in != pb_in);
     try std.testing.expectEqual(pa_in, pa_paint);
     try std.testing.expectEqual(pb_in, pb_paint);
+}
+
+test "Context: audioPlayer and videoPlayer two-phase execution" {
+    const surface = try skia.Surface.initRasterN32Premul(640, 360);
+    defer surface.deinit();
+
+    const font = try Font.init(null, 12.0);
+    defer font.deinit();
+
+    const paint = try skia.Paint.init();
+    defer paint.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var uic = Context{
+        .arena = arena.allocator(),
+        .canvas = surface.canvas(),
+        .paint = paint,
+        .font_title = font,
+        .font_body = font,
+        .font_mono = font,
+    };
+    defer uic.deinit();
+
+    var audio_st = AudioPlayerState{};
+    var video_st = VideoPlayerState{};
+    const win_r = Rect.xywh(0, 0, 640, 360);
+
+    // Pass.input
+    _ = arena.reset(.retain_capacity);
+    uic.beginPass(.input, arena.allocator(), surface.canvas(), win_r, 320.0, 180.0, false, false, false);
+    const aud_res1 = uic.audioPlayer("test_aud", 640.0, 180.0, &audio_st, .{});
+    const vid_res1 = uic.videoPlayer("test_vid", 640.0, 180.0, &video_st, .{});
+    uic.endPass();
+
+    try std.testing.expect(aud_res1.duration > 0.0);
+    try std.testing.expect(vid_res1.duration > 0.0);
+
+    // Pass.paint
+    uic.clip_damage = win_r;
+    uic.beginPass(.paint, arena.allocator(), surface.canvas(), win_r, 320.0, 180.0, false, false, false);
+    const aud_res2 = uic.audioPlayer("test_aud", 640.0, 180.0, &audio_st, .{});
+    const vid_res2 = uic.videoPlayer("test_vid", 640.0, 180.0, &video_st, .{});
+    uic.endPass();
+
+    try std.testing.expectEqual(aud_res1.duration, aud_res2.duration);
+    try std.testing.expectEqual(vid_res1.duration, vid_res2.duration);
 }
 

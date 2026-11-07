@@ -15,6 +15,9 @@ pub const workspace_fs = @import("workspace_fs.zig");
 pub const plugin_manager = @import("plugin_manager.zig");
 pub const hot_reload_stash = @import("hot_reload_stash.zig");
 pub const workspace_search = @import("workspace_search.zig");
+pub const keybindings_mod = @import("keybindings.zig");
+pub const tasks_mod = @import("tasks.zig");
+pub const commands_mod = @import("commands.zig");
 
 pub const STATE_VERSION: u64 = 0x2026_1022_B001;
 
@@ -37,7 +40,7 @@ pub const MaxTabsPerPane: usize = 8;
 pub const MaxOpenBuffers: usize = 24;
 pub const MaxTerminalBuffers: usize = 8;
 pub const MaxAgentBuffers: usize = 8;
-pub const MaxOutputLines: usize = 128;
+pub const MaxOutputLines: usize = 2048;
 
 pub const OutputLine = struct {
     channel: platform.InlineString(24) = .{},
@@ -73,6 +76,7 @@ pub const EditorDocument = struct {
     show_sidebar: bool = false,
     active_sidebar_view: u8 = 0,
     show_bottom_panel: bool = false,
+    bottom_panel_tab: u8 = 0, // 0 = Terminal, 1 = Problems, 2 = Output
     show_agent_panel: bool = false,
     agy_include_context: bool = true,
     supercomplete_enabled: bool = true,
@@ -139,6 +143,23 @@ pub const DynamicFileStorage = struct {
     custom_name: platform.InlineString(64) = .{},
     name_offset: u16 = 0,
     seen_on_disk: bool = false,
+    cached_disk_size: ?usize = null,
+};
+
+/// Pointer-free flattened tree row entry for O(1) memoized & virtualized File Browser rendering.
+pub const ExplorerFlatNode = struct {
+    is_folder: bool = false,
+    from_folder_list: bool = false,
+    depth: u16 = 0,
+    path_len: u16 = 0,
+    badge_len: u8 = 0,
+    badge_buf: [9]u8 = @splat(0),
+    item_idx: u32 = 0,
+    rec_file_count: u32 = 0,
+
+    pub fn badgeSlice(self: *const ExplorerFlatNode) []const u8 {
+        return self.badge_buf[0..@min(@as(usize, self.badge_len), self.badge_buf.len)];
+    }
 };
 
 pub const SymbolItem = analysis.SymbolItem;
@@ -228,11 +249,15 @@ pub const EditorState = struct {
     pdf_custom_bytes: platform.InlineString(4096) = .{},
     pdf_views: [MaxEditorPanes]ui.PdfViewState = @splat(.{}),
     image_views: [MaxEditorPanes]ui.ImageViewState = @splat(.{}),
+    audio_views: [MaxEditorPanes]ui.AudioPlayerState = @splat(.{}),
+    video_views: [MaxEditorPanes]ui.VideoPlayerState = @splat(.{}),
     git_diff_custom_text: platform.InlineString(16384) = .{},
     git_diff_custom_path: platform.InlineString(128) = .{},
     git_diff_title: platform.InlineString(128) = .{},
     git_diff_commit: platform.InlineString(16) = .{},
     git_diff_views: [MaxEditorPanes]ui.DiffViewState = @splat(.{}),
+    app_views: [MaxEditorPanes]ui.AppSimulatorState = @splat(.{}),
+    app_custom_path: platform.InlineString(256) = .{},
     palette_query: platform.InlineString(256) = .{},
     palette_selected_idx: usize = 0,
     save_as_path: platform.InlineString(256) = .{},
@@ -256,6 +281,9 @@ pub const EditorState = struct {
     status_notice: platform.InlineString(96) = .{},
     output_lines: [MaxOutputLines]OutputLine = undefined,
     output_line_count: usize = 0,
+    output_channel_filter: platform.InlineString(24) = .{},
+    output_scroll_to_bottom: bool = false,
+    task_runner: tasks_mod.TaskRunner = .{},
     vterm: ui.VTerm = undefined,
     term_vterms: []ui.VTerm = &.{},
     term_vterms_list: std.ArrayListUnmanaged(ui.VTerm) = .empty,
@@ -283,6 +311,9 @@ pub const EditorState = struct {
 
     // Native Zig `.dylib` Plugin Manager (hot-reloads `zig-out/plugins/*.dylib` and dispatches hooks)
     plugins: plugin_manager.PluginManager = .{},
+
+    // VS Code-compatible keybinding system and active chord dispatch
+    keybindings: keybindings_mod.KeybindingManager = .{},
 
     // Live tab drag-and-drop reorganization tracking via `ui.TabDragState`
     tab_drag: ui.TabDragState = .{},
@@ -319,6 +350,16 @@ pub const EditorState = struct {
     cached_search_matches: [MaxWorkspaceSearchMatches]WorkspaceSearchMatch = @splat(.{}),
     cached_search_match_count: usize = 0,
     cached_search_sig: u64 = 0,
+
+    // Memoized Explorer File Tree cache (O(1) on steady/scroll frames; rebuilt only when workspace files/folders or folder expansion changes)
+    cached_tree_nodes_list: std.ArrayListUnmanaged(ExplorerFlatNode) = .empty,
+    cached_tree_sig: u64 = 0,
+    cached_non_special_file_count: usize = 0,
+    workspace_tree_gen: u64 = 1,
+    scanned_files_in_pass: usize = 0,
+    cached_waveform_source_tree_gen: u64 = 0,
+    cached_waveform_source_doc_idx: u16 = 0,
+    cached_waveform_source_result: ?usize = null,
 
     pub fn syncDynamicSlices(self: *EditorState) void {
         self.file_storage = self.file_storage_list.items;
@@ -434,6 +475,10 @@ pub const EditorState = struct {
         for (self.folder_storage) |*fs| fs.* = .{};
         for (self.git_file_statuses) |*g| g.* = .{};
         for (&self.output_lines) |*o| o.* = .{};
+        self.output_line_count = 0;
+        self.output_channel_filter = .{};
+        self.output_scroll_to_bottom = false;
+        self.task_runner = .{};
         self.vterm = ui.VTerm.init();
         for (self.term_vterms, 0..) |*vt, i| {
             vt.* = ui.VTerm.init();
@@ -495,6 +540,8 @@ pub const EditorState = struct {
                 self.agy.setStatus("Connected to Hub");
                 self.syncAgyHubState();
             }
+            self.keybindings.initDefaults(std.heap.c_allocator) catch {};
+            self.keybindings.loadFromDisk(std.heap.c_allocator, self.workspaceRoot());
         }
     }
 
@@ -513,6 +560,9 @@ pub const EditorState = struct {
         for (self.agent_sessions) |*as| {
             as.deinit();
         }
+        for (&self.app_views) |*av| {
+            av.deinit();
+        }
         self.file_storage_list.deinit(alloc);
         self.files_list.deinit(alloc);
         self.folder_list.deinit(alloc);
@@ -528,12 +578,15 @@ pub const EditorState = struct {
         self.agent_sessions_list.deinit(alloc);
         self.agent_prompts_list.deinit(alloc);
         self.agent_slot_used_list.deinit(alloc);
+        self.cached_tree_nodes_list.deinit(alloc);
         self.syncDynamicSlices();
         self.vterm.deinit();
         self.agy.deinit();
         self.supercomplete.deinit();
+        self.task_runner.terminate();
         self.git_poller.deinit();
         self.plugins.deinit(self);
+        self.keybindings.deinit(alloc);
         self.ui_ctx.deinit();
         self.fonts.deinit();
         self.frame_arena.deinit();
@@ -774,11 +827,21 @@ pub const EditorState = struct {
         self.agy.syncWorkspaceRoot(self.workspaceRoot());
         self.syncAgyHubState();
 
-        // Open the first non-special file in the newly opened workspace
+        // Open the first non-special text/document file in the newly opened workspace (falling back to any non-special file)
+        var opened_initial = false;
         for (self.workspaceFiles(), 0..) |wf, idx| {
-            if (!wf.isSpecial()) {
+            if (!wf.isSpecial() and !isBinaryExtension(wf.path)) {
                 self.openFile(idx);
+                opened_initial = true;
                 break;
+            }
+        }
+        if (!opened_initial) {
+            for (self.workspaceFiles(), 0..) |wf, idx| {
+                if (!wf.isSpecial()) {
+                    self.openFile(idx);
+                    break;
+                }
             }
         }
 
@@ -916,6 +979,22 @@ pub const EditorState = struct {
         return count;
     }
 
+    /// Returns the byte length of buffer `f_idx` in memory, or its cached on-disk byte size when unloaded
+    /// (avoiding repeated per-frame `stat()` syscalls in the `OPEN BUFFERS` sidebar).
+    pub fn fileByteSize(self: *EditorState, f_idx: usize) usize {
+        if (f_idx >= self.file_count) return 0;
+        const file = self.files[f_idx];
+        if (self.loaded_from_disk[f_idx] or file.isSpecial() or self.isFileDirty(f_idx)) {
+            return self.buffers[f_idx].slice().len;
+        }
+        if (self.file_storage[f_idx].cached_disk_size) |sz| {
+            return sz;
+        }
+        const queried = regularFileSizeOnDisk(file.path.ptr) orelse 0;
+        self.file_storage[f_idx].cached_disk_size = queried;
+        return queried;
+    }
+
     pub fn findWorkspaceFileIndexByPath(self: *const EditorState, rel_path: []const u8) ?usize {
         for (self.workspaceFiles(), 0..) |wf, idx| {
             if (!wf.isSpecial() and std.mem.eql(u8, wf.path, rel_path)) return idx;
@@ -998,6 +1077,7 @@ pub const EditorState = struct {
     pub const regularFileSizeOnDisk = workspace_fs.regularFileSizeOnDisk;
     pub const fileMtimeSec = workspace_fs.fileMtimeSec;
     pub const findProjectRootForFile = workspace_fs.findProjectRootForFile;
+    pub const isBinaryExtension = workspace_fs.isBinaryExtension;
     pub const isBinaryContent = workspace_fs.isBinaryContent;
     pub const isBinaryFileOnDisk = workspace_fs.isBinaryFileOnDisk;
     pub const fileExistsOnDisk = workspace_fs.fileExistsOnDisk;
@@ -1124,6 +1204,7 @@ pub const EditorState = struct {
         self.buffer_word_wrap[self.file_count - 1] = 0;
         self.git_file_statuses[self.file_count - 1] = .{};
         self.file_count -= 1;
+        self.workspace_tree_gen +%= 1;
         self.rebindDynamicFileSlices();
 
         // Adjust any open buffer / pane tab indices above `remove_idx`
@@ -1163,11 +1244,11 @@ pub const EditorState = struct {
         }
     }
 
-    fn registerDiscoveredWorkspaceFile(self: *EditorState, rel_path: []const u8) void {
+    pub fn registerDiscoveredWorkspaceFile(self: *EditorState, rel_path: []const u8) void {
         if (rel_path.len == 0 or rel_path.len >= 254) return;
 
         var existing_opt: ?usize = null;
-        for (self.files[0..self.file_count], 0..) |wf, idx| {
+        for (self.files[0..self.file_count], 0..) |*wf, idx| {
             if (!wf.isSpecial() and std.mem.eql(u8, wf.path, rel_path)) {
                 existing_opt = idx;
                 break;
@@ -1175,6 +1256,7 @@ pub const EditorState = struct {
         }
 
         if (shouldIgnoreScannedPath(rel_path)) return;
+        self.scanned_files_in_pass += 1;
 
         if (existing_opt) |idx| {
             self.file_storage[idx].seen_on_disk = true;
@@ -1192,6 +1274,7 @@ pub const EditorState = struct {
             self.git_file_statuses[new_idx] = .{};
             self.file_storage[new_idx].seen_on_disk = true;
             self.file_count += 1;
+            self.workspace_tree_gen +%= 1;
         }
     }
 
@@ -1242,6 +1325,12 @@ pub const EditorState = struct {
                 if (seed.is_git_diff_preview) {
                     self.files[idx].is_git_diff_preview = true;
                     self.files[idx].name = "*Git Diff*";
+                    self.file_storage[idx].folder.set("*special*");
+                    self.files[idx].folder = self.file_storage[idx].folder.slice();
+                }
+                if (seed.is_app_preview) {
+                    self.files[idx].is_app_preview = true;
+                    self.files[idx].name = "*App Preview*";
                     self.file_storage[idx].folder.set("*special*");
                     self.files[idx].folder = self.file_storage[idx].folder.slice();
                 }
@@ -1370,18 +1459,9 @@ pub const EditorState = struct {
                 }
             } else if (collect_files) {
                 if (effective_name.len < 256) {
-                    var already_present = false;
-                    for (file_names.items) |*fn_entry| {
-                        if (std.mem.eql(u8, fn_entry.slice(), effective_name)) {
-                            already_present = true;
-                            break;
-                        }
-                    }
-                    if (!already_present) {
-                        var fn_item: platform.InlineString(256) = .{};
-                        fn_item.set(effective_name);
-                        file_names.append(alloc, fn_item) catch {};
-                    }
+                    var fn_item: platform.InlineString(256) = .{};
+                    fn_item.set(effective_name);
+                    file_names.append(alloc, fn_item) catch {};
                 }
             }
         }
@@ -1389,17 +1469,17 @@ pub const EditorState = struct {
         // 1. Sort and register all immediate files in `rel_dir` FIRST so shallow files are prioritized
         if (collect_files and file_names.items.len > 0) {
             if (file_names.items.len > 1) {
-                var i: usize = 1;
-                while (i < file_names.items.len) : (i += 1) {
-                    const cur = file_names.items[i];
-                    var j: usize = i;
-                    while (j > 0 and asciiLessThanIgnoreCaseSlice(cur.slice(), file_names.items[j - 1].slice())) : (j -= 1) {
-                        file_names.items[j] = file_names.items[j - 1];
+                const InlineStrSort = struct {
+                    pub fn lessThan(_: void, a: platform.InlineString(256), b: platform.InlineString(256)) bool {
+                        return asciiLessThanIgnoreCaseSlice(a.slice(), b.slice());
                     }
-                    file_names.items[j] = cur;
-                }
+                };
+                std.mem.sort(platform.InlineString(256), file_names.items, {}, InlineStrSort.lessThan);
             }
-            for (file_names.items) |*fn_entry| {
+            const unexpanded_deep_dir = (depth > 1 and !self.isFolderExpanded(rel_dir));
+            for (file_names.items, 0..) |*fn_entry, fn_i| {
+                if (fn_i > 0 and fn_entry.eql(file_names.items[fn_i - 1].slice())) continue;
+                if (unexpanded_deep_dir and self.scanned_files_in_pass >= 4096) break;
                 var child_buf: [256:0]u8 = @splat(0);
                 const child_slice = if (rel_dir.len == 0)
                     std.fmt.bufPrint(child_buf[0..254], "{s}", .{fn_entry.slice()}) catch continue
@@ -1450,6 +1530,8 @@ pub const EditorState = struct {
 
     pub fn scanWorkspaceDirectories(self: *EditorState, collect_files: bool) void {
         self.folder_count = 0;
+        self.scanned_files_in_pass = 0;
+        self.workspace_tree_gen +%= 1;
         self.scanSingleDirectoryLevel("", 0, collect_files);
         var q_idx: usize = 0;
         while (q_idx < self.folder_count) : (q_idx += 1) {
@@ -1461,7 +1543,7 @@ pub const EditorState = struct {
             // Always scan expanded directories, shallow directories (depth <= 1), and all project
             // directories while total indexed files < 4096; unexpanded deep vendor/archive folders
             // in massive workspaces (e.g. Desktop) are scanned lazily on expand (`setFolderExpanded`).
-            if (collect_files and self.file_count >= 4096 and depth > 1 and !self.isFolderExpanded(dir_buf[0..dlen])) {
+            if (collect_files and self.scanned_files_in_pass >= 4096 and depth > 1 and !self.isFolderExpanded(dir_buf[0..dlen])) {
                 continue;
             }
             self.scanSingleDirectoryLevel(dir_buf[0..dlen], depth, collect_files);
@@ -1470,7 +1552,7 @@ pub const EditorState = struct {
 
     pub const statMtimeHash = workspace_fs.statMtimeHash;
 
-    fn computeWorkspaceWatchSignature(self: *const EditorState) u64 {
+    pub fn computeWorkspaceWatchSignature(self: *const EditorState) u64 {
         const base_watched_paths = [_][*:0]const u8{
             ".",
             ".gitignore",
@@ -1500,16 +1582,71 @@ pub const EditorState = struct {
             }
         }
         // Stat any open buffer files so external edits/deletions of open files are detected immediately
-        for (0..self.file_count) |f_idx| {
-            if (!self.files[f_idx].isSpecial() and (self.isBufferOpen(f_idx) or self.bufferVisibleInPane(f_idx) != null or self.isFileReferencedByOpenPreview(f_idx))) {
-                var fh = statMtimeHash(self.files[f_idx].path.ptr);
-                if (fh == 0 and fileExistsOnDisk(self.files[f_idx].path)) {
-                    fh = 0xA5A5_5A5A_F0F0_0F0F;
-                }
-                sig = (sig ^ (fh +% (@as(u64, @intCast(f_idx + 192)) *% 0x94D0_49BB_1331_11EB))) *% 0xBF58_476D_1CE4_E5B9;
+        var watched_files_buf: [256]usize = undefined;
+        const watched_files = self.collectWatchedOpenFileIndices(&watched_files_buf);
+        for (watched_files) |f_idx| {
+            var fh = statMtimeHash(self.files[f_idx].path.ptr);
+            if (fh == 0 and fileExistsOnDisk(self.files[f_idx].path)) {
+                fh = 0xA5A5_5A5A_F0F0_0F0F;
             }
+            sig = (sig ^ (fh +% (@as(u64, @intCast(f_idx + 192)) *% 0x94D0_49BB_1331_11EB))) *% 0xBF58_476D_1CE4_E5B9;
         }
         return sig;
+    }
+
+    /// Collects all unique non-special file indices that are currently open in `open_buffers`,
+    /// visible in any split pane, or referenced by an open Markdown preview buffer, sorted in
+    /// ascending order in `O(open_buffers)` rather than scanning all `0..file_count` workspace files.
+    fn collectWatchedOpenFileIndices(self: *const EditorState, out_buf: *[256]usize) []const usize {
+        var count: usize = 0;
+        const wfs = self.workspaceFiles();
+        const Helper = struct {
+            fn addUniqueSorted(buf: *[256]usize, cnt: *usize, idx: usize) void {
+                for (0..cnt.*) |i| {
+                    if (buf[i] == idx) return;
+                    if (buf[i] > idx) {
+                        if (cnt.* < buf.len) {
+                            var j = cnt.*;
+                            while (j > i) : (j -= 1) {
+                                buf[j] = buf[j - 1];
+                            }
+                            buf[i] = idx;
+                            cnt.* += 1;
+                        }
+                        return;
+                    }
+                }
+                if (cnt.* < buf.len) {
+                    buf[cnt.*] = idx;
+                    cnt.* += 1;
+                }
+            }
+            fn addCandidate(s: *const EditorState, files: []const SampleFile, buf: *[256]usize, cnt: *usize, raw_idx: usize) void {
+                if (raw_idx >= files.len) return;
+                const wf = &files[raw_idx];
+                if (wf.is_markdown_preview) {
+                    if (s.findMarkdownPreviewSourceIndexForBuffer(raw_idx)) |src_idx| {
+                        if (src_idx < files.len and !files[src_idx].isSpecial()) {
+                            addUniqueSorted(buf, cnt, src_idx);
+                        }
+                    }
+                } else if (!wf.isSpecial()) {
+                    addUniqueSorted(buf, cnt, raw_idx);
+                }
+            }
+        };
+
+        const open_n = self.openBufferCount();
+        for (0..open_n) |b_i| {
+            Helper.addCandidate(self, wfs, out_buf, &count, self.doc.open_buffers[b_i]);
+        }
+        for (0..MaxEditorPanes) |pane_i| {
+            const t_n = @min(@as(usize, self.doc.panes[pane_i].tab_count), MaxTabsPerPane);
+            for (0..t_n) |t_i| {
+                Helper.addCandidate(self, wfs, out_buf, &count, self.doc.panes[pane_i].tabs[t_i]);
+            }
+        }
+        return out_buf[0..count];
     }
 
     /// Lightweight filesystem watcher polled during input frames (~800ms interval).
@@ -1587,6 +1724,12 @@ pub const EditorState = struct {
                 self.syncAgyHubState();
             }
             self.ui_ctx.invalidateWindow();
+        }
+
+        // Poll active task execution context incrementally
+        self.task_runner.poll(self);
+        if (self.task_runner.is_running) {
+            if (self.ui_ctx.platform_ctx) |pctx| pctx.needs_continuous_redraw = true;
         }
 
         // When no workspace directory is opened, do not watch or poll filesystem/git
@@ -2182,14 +2325,29 @@ pub const EditorState = struct {
     }
 
     pub fn isFileReferencedByOpenPreview(self: *const EditorState, file_idx: usize) bool {
+        var watched_buf: [256]usize = undefined;
         const wfs = self.workspaceFiles();
-        for (wfs, 0..) |wf, p_idx| {
-            if (!wf.is_markdown_preview) continue;
-            if (!self.isBufferOpen(p_idx) and self.bufferVisibleInPane(p_idx) == null) continue;
-            if (self.findMarkdownPreviewSourceIndexForBuffer(p_idx)) |src_idx| {
-                if (src_idx == file_idx) return true;
+        const open_n = self.openBufferCount();
+        for (0..open_n) |b_i| {
+            const p_idx: usize = self.doc.open_buffers[b_i];
+            if (p_idx < wfs.len and wfs[p_idx].is_markdown_preview) {
+                if (self.findMarkdownPreviewSourceIndexForBuffer(p_idx)) |src_idx| {
+                    if (src_idx == file_idx) return true;
+                }
             }
         }
+        for (0..MaxEditorPanes) |pane_i| {
+            const t_n = @min(@as(usize, self.doc.panes[pane_i].tab_count), MaxTabsPerPane);
+            for (0..t_n) |t_i| {
+                const p_idx: usize = self.doc.panes[pane_i].tabs[t_i];
+                if (p_idx < wfs.len and wfs[p_idx].is_markdown_preview) {
+                    if (self.findMarkdownPreviewSourceIndexForBuffer(p_idx)) |src_idx| {
+                        if (src_idx == file_idx) return true;
+                    }
+                }
+            }
+        }
+        _ = &watched_buf;
         return false;
     }
 
@@ -2200,7 +2358,7 @@ pub const EditorState = struct {
         if (wfs[idx].language == .markdown and !wfs[idx].is_markdown_preview) {
             return idx;
         }
-        for (wfs, 0..) |wf, i| {
+        for (wfs, 0..) |*wf, i| {
             if (wf.language == .markdown and !wf.isSpecial()) {
                 return i;
             }
@@ -2256,13 +2414,31 @@ pub const EditorState = struct {
         if (isWaveformCandidatePath(wfs[idx].path) and !wfs[idx].is_waveform_preview) {
             return idx;
         }
-        for (wfs, 0..) |wf, i| {
-            if (std.mem.endsWith(u8, wf.path, ".vcd") and !wf.is_waveform_preview) return i;
+        if (self.cached_waveform_source_tree_gen == self.workspace_tree_gen and
+            self.cached_waveform_source_doc_idx == self.doc.waveform_preview_source_idx)
+        {
+            return self.cached_waveform_source_result;
         }
-        for (wfs, 0..) |wf, i| {
-            if (isWaveformCandidatePath(wf.path) and !wf.is_waveform_preview) return i;
+        var found: ?usize = null;
+        for (wfs, 0..) |*wf, i| {
+            if (std.mem.endsWith(u8, wf.path, ".vcd") and !wf.is_waveform_preview) {
+                found = i;
+                break;
+            }
         }
-        return null;
+        if (found == null) {
+            for (wfs, 0..) |*wf, i| {
+                if (isWaveformCandidatePath(wf.path) and !wf.is_waveform_preview) {
+                    found = i;
+                    break;
+                }
+            }
+        }
+        const mut_self: *EditorState = @constCast(self);
+        mut_self.cached_waveform_source_tree_gen = self.workspace_tree_gen;
+        mut_self.cached_waveform_source_doc_idx = self.doc.waveform_preview_source_idx;
+        mut_self.cached_waveform_source_result = found;
+        return found;
     }
 
     pub fn waveformPreviewSourceIndex(self: *const EditorState) usize {
@@ -2272,6 +2448,62 @@ pub const EditorState = struct {
     pub const isVcdCandidatePath = workspace_fs.isVcdCandidatePath;
     pub const isPdfCandidatePath = workspace_fs.isPdfCandidatePath;
     pub const isImageCandidatePath = workspace_fs.isImageCandidatePath;
+    pub const isAudioCandidatePath = workspace_fs.isAudioCandidatePath;
+    pub const isVideoCandidatePath = workspace_fs.isVideoCandidatePath;
+    pub const isMediaCandidatePath = workspace_fs.isMediaCandidatePath;
+
+    pub fn isAppCandidatePath(path: []const u8) bool {
+        return std.mem.endsWith(u8, path, ".dylib") or
+            std.mem.endsWith(u8, path, ".so") or
+            std.mem.endsWith(u8, path, ".dll");
+    }
+
+    /// Creates/opens the `*App Preview*` simulator buffer either in the active split window (`split_to_side == false`)
+    /// or in a new horizontal split window to the right (`split_to_side == true`).
+    pub fn openAppPreviewBuffer(self: *EditorState, split_to_side: bool) void {
+        const preview_idx = self.appPreviewBufferIndex();
+        self.ensureBufferInOpenList(preview_idx);
+        if (split_to_side) {
+            self.splitPaneDirection(self.activePaneIndex(), false, false, preview_idx, null);
+        } else {
+            self.openFile(preview_idx);
+        }
+        self.setStatusNotice("Opened *App Preview* simulator buffer");
+    }
+
+    /// Opens `*App Preview*` with an explicit dylib path.
+    pub fn openAppPreviewWithDylib(self: *EditorState, dylib_path: []const u8, split_to_side: bool) void {
+        if (dylib_path.len > 0) {
+            self.app_custom_path.set(dylib_path);
+            const slot = @min(self.activePaneIndex(), MaxEditorPanes - 1);
+            self.app_views[slot].setDylibPath(dylib_path);
+        }
+        self.openAppPreviewBuffer(split_to_side);
+    }
+
+    pub fn appPreviewBufferIndex(self: *EditorState) usize {
+        const wfs = self.workspaceFiles();
+        for (wfs, 0..) |wf, idx| {
+            if (wf.is_app_preview) return idx;
+        }
+        return self.ensureAppPreviewBufferSlot();
+    }
+
+    pub fn ensureAppPreviewBufferSlot(self: *EditorState) usize {
+        for (self.files[0..self.file_count], 0..) |*wf, idx| {
+            if (wf.is_app_preview) return idx;
+        }
+        if (self.ensureFreeDynamicFileSlot()) |slot| {
+            self.storeDynamicFileSlot(slot, "*App Preview*", .zig, false, false, "");
+            self.files[slot].is_app_preview = true;
+            self.files[slot].name = "*App Preview*";
+            self.file_storage[slot].folder.set("*special*");
+            self.files[slot].folder = self.file_storage[slot].folder.slice();
+            self.file_count += 1;
+            return slot;
+        }
+        return if (self.file_count > 0) self.file_count - 1 else 0;
+    }
 
     /// Creates/opens the `*PDF Preview*` buffer either in the active split window (`split_to_side == false`)
     /// or in a new horizontal split window to the right (`split_to_side == true`).
@@ -2317,7 +2549,7 @@ pub const EditorState = struct {
         if (isPdfCandidatePath(wfs[idx].path) and !wfs[idx].is_pdf_preview) {
             return idx;
         }
-        for (wfs, 0..) |wf, i| {
+        for (wfs, 0..) |*wf, i| {
             if (isPdfCandidatePath(wf.path) and !wf.is_pdf_preview) return i;
         }
         return null;
@@ -2399,7 +2631,7 @@ pub const EditorState = struct {
         if (wfs.len == 0) return null;
         const idx: usize = @as(usize, self.doc.git_diff_source_idx) % wfs.len;
         if (!wfs[idx].isSpecial()) return idx;
-        for (wfs, 0..) |wf, i| {
+        for (wfs, 0..) |*wf, i| {
             if (!wf.isSpecial()) return i;
         }
         return null;
@@ -2731,6 +2963,8 @@ pub const EditorState = struct {
             self.git_diff_views[i] = self.git_diff_views[i + 1];
             self.pdf_views[i] = self.pdf_views[i + 1];
             self.image_views[i] = self.image_views[i + 1];
+            self.audio_views[i] = self.audio_views[i + 1];
+            self.video_views[i] = self.video_views[i + 1];
             self.scratch_buf.copyScrollStateBetweenPanes(i + 1, i);
             for (0..self.file_count) |f_i| {
                 if (self.buffer_initialized[f_i]) {
@@ -2908,9 +3142,9 @@ pub const EditorState = struct {
                 self.setStatusNotice("Downloading file from iCloud Drive in background...");
                 return;
             }
-            // For `.pdf` and raster image files larger than 32 KB on disk, the native viewers stream directly
+            // For `.pdf`, raster image, audio, and video files larger than 32 KB on disk, native viewers stream directly
             // from `file.path`, avoiding reading megabytes of binary bytes into a text `CodeEditorBuffer`.
-            if ((isPdfCandidatePath(file.path) or isImageCandidatePath(file.path)) and disk_size > 32 * 1024) {
+            if ((isPdfCandidatePath(file.path) or isImageCandidatePath(file.path) or isAudioCandidatePath(file.path) or isVideoCandidatePath(file.path)) and disk_size > 32 * 1024) {
                 buf.resetWithSlice("");
                 self.saved_versions[idx] = buf.edit_version;
                 self.loaded_from_disk[idx] = true;
@@ -3009,7 +3243,7 @@ pub const EditorState = struct {
         if (cur_hash == 0 or cur_hash == self.disk_mtime_hashes[idx]) return false;
 
         const disk_size = regularFileSizeOnDisk(file.path.ptr) orelse return false;
-        if ((isPdfCandidatePath(file.path) or isImageCandidatePath(file.path)) and disk_size > 32 * 1024) {
+        if ((isPdfCandidatePath(file.path) or isImageCandidatePath(file.path) or isAudioCandidatePath(file.path) or isVideoCandidatePath(file.path)) and disk_size > 32 * 1024) {
             const buf = self.ensureBufferSlotInit(idx);
             buf.edit_version +%= 1;
             if (buf.edit_version == 0) buf.edit_version = 1;
@@ -3028,12 +3262,12 @@ pub const EditorState = struct {
     /// on-disk contents have changed. Returns the number of buffers reloaded.
     pub fn reloadModifiedOpenFiles(self: *EditorState) usize {
         var reloaded: usize = 0;
-        for (0..self.file_count) |idx| {
-            if (self.files[idx].isSpecial() or self.isFileDirty(idx)) continue;
-            if (self.isBufferOpen(idx) or self.bufferVisibleInPane(idx) != null or self.isFileReferencedByOpenPreview(idx)) {
-                if (self.reloadFileFromDiskIfChanged(idx)) {
-                    reloaded += 1;
-                }
+        var watched_files_buf: [256]usize = undefined;
+        const watched_files = self.collectWatchedOpenFileIndices(&watched_files_buf);
+        for (watched_files) |idx| {
+            if (self.isFileDirty(idx)) continue;
+            if (self.reloadFileFromDiskIfChanged(idx)) {
+                reloaded += 1;
             }
         }
         if (reloaded > 0) {
@@ -3042,7 +3276,7 @@ pub const EditorState = struct {
                 self.syncCursorTelemetry(active_idx);
             }
             if (self.git_diff_commit.len == 0) {
-                for (self.workspaceFiles(), 0..) |wf, i| {
+                for (self.workspaceFiles(), 0..) |*wf, i| {
                     if (wf.is_git_diff_preview and (self.isBufferOpen(i) or self.bufferVisibleInPane(i) != null)) {
                         self.refreshActiveGitDiffContent();
                         break;
@@ -3075,6 +3309,18 @@ pub const EditorState = struct {
         }
         if (isImageCandidatePath(file.path)) {
             self.setStatusNotice("Image files are read-only in Image Viewer");
+            return false;
+        }
+        if (isAudioCandidatePath(file.path)) {
+            self.setStatusNotice("Audio files are read-only in Audio Player");
+            return false;
+        }
+        if (isVideoCandidatePath(file.path)) {
+            self.setStatusNotice("Video files are read-only in Video Player");
+            return false;
+        }
+        if (isBinaryExtension(file.path) or isBinaryFileOnDisk(file.path)) {
+            self.setStatusNotice("Binary files are read-only");
             return false;
         }
         if (file.is_git_diff_preview) {
@@ -3113,9 +3359,10 @@ pub const EditorState = struct {
 
     pub fn isFileDirty(self: *const EditorState, idx: usize) bool {
         if (!self.buffer_initialized[idx]) return false;
-        if (idx < self.file_count and (self.files[idx].is_pdf_preview or isPdfCandidatePath(self.files[idx].path) or isImageCandidatePath(self.files[idx].path))) return false;
+        if (self.buffers[idx].edit_version == self.saved_versions[idx]) return false;
         if (!self.loaded_from_disk[idx] and self.buffers[idx].len == 0) return false;
-        return self.buffers[idx].edit_version != self.saved_versions[idx];
+        if (idx < self.file_count and (self.files[idx].is_pdf_preview or isPdfCandidatePath(self.files[idx].path) or isImageCandidatePath(self.files[idx].path) or isAudioCandidatePath(self.files[idx].path) or isVideoCandidatePath(self.files[idx].path))) return false;
+        return true;
     }
 
     pub fn isScratchDirty(self: *const EditorState) bool {
@@ -4302,6 +4549,7 @@ pub const EditorState = struct {
     pub fn appendOutput(self: *EditorState, channel: []const u8, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
+        self.output_scroll_to_bottom = true;
         if (self.output_line_count < MaxOutputLines) {
             var entry = &self.output_lines[self.output_line_count];
             entry.* = .{};
@@ -4321,6 +4569,64 @@ pub const EditorState = struct {
 
     pub fn clearOutput(self: *EditorState) void {
         self.output_line_count = 0;
+    }
+
+    /// Executes the workspace build task (`Cmd+Shift+B` / `workbench.action.tasks.build`).
+    pub fn runBuildTask(self: *EditorState, active_bottom_tab: ?*u8) void {
+        tasks_mod.runBuildTask(self, active_bottom_tab);
+    }
+
+    /// Opens `.vscode/keybindings.json` (or creates a starter template from current keybindings if absent) in an editor tab.
+    pub fn openKeybindingsFile(self: *EditorState) void {
+        const rel_path = ".vscode/keybindings.json";
+        if (self.findWorkspaceFileIndexByPath(rel_path)) |f_idx| {
+            self.openFile(f_idx);
+            self.setStatusNotice("Opened .vscode/keybindings.json");
+            return;
+        }
+
+        // Create .vscode/keybindings.json on disk if needed
+        var full_buf: [400]u8 = undefined;
+        if (std.fmt.bufPrint(&full_buf, "{s}/.vscode/keybindings.json\x00", .{self.workspaceRoot()})) |full_p| {
+            const full_p_z: [*:0]const u8 = @ptrCast(full_p.ptr);
+            if (std.c.fopen(full_p_z, "rb")) |f| {
+                _ = std.c.fclose(f);
+            } else {
+                var dir_buf: [320]u8 = undefined;
+                if (std.fmt.bufPrint(&dir_buf, "{s}/.vscode\x00", .{self.workspaceRoot()})) |dir_p| {
+                    const dir_p_z: [*:0]const u8 = @ptrCast(dir_p.ptr);
+                    _ = platform.fs_util.mkdir(dir_p_z, 0o755);
+                } else |_| {}
+
+                const default_json = self.keybindings.exportToJson(std.heap.c_allocator) catch "[\n]\n";
+                defer std.heap.c_allocator.free(default_json);
+                if (std.c.fopen(full_p_z, "wb")) |f| {
+                    _ = std.c.fwrite(default_json.ptr, 1, default_json.len, f);
+                    _ = std.c.fclose(f);
+                }
+            }
+            self.refreshWorkspaceFiles(true);
+            if (self.findWorkspaceFileIndexByPath(rel_path)) |f_idx| {
+                self.openFile(f_idx);
+                self.setStatusNotice("Created and opened .vscode/keybindings.json");
+                return;
+            }
+        } else |_| {}
+        self.setStatusNotice("Unable to open keybindings.json");
+    }
+
+    /// Opens the Keyboard Shortcuts overview in an editor buffer or JSON config.
+    pub fn openKeybindingsView(self: *EditorState) void {
+        self.openKeybindingsFile();
+    }
+
+    /// Formats the current display string for `cmd`, reflecting any active user keybinding overrides.
+    pub fn shortcutDisplayForCommand(self: *EditorState, cmd: commands_mod.CommandId, fallback: []const u8) []const u8 {
+        var buf: [48]u8 = undefined;
+        if (self.keybindings.formatShortcutForCommand(cmd, &buf)) |disp| {
+            return self.ui_ctx.fmt("{s}", .{disp});
+        }
+        return fallback;
     }
 
     pub const folderPathHash = workspace_fs.folderPathHash;
@@ -4367,6 +4673,10 @@ pub const EditorState = struct {
             const depth = 1 + std.mem.count(u8, folder_path, "/");
             self.scanSingleDirectoryLevel(folder_path, depth, true);
         }
+        self.workspace_tree_gen +%= 1;
+        if (self.has_opened_workspace and self.last_watch_sig != 0) {
+            self.last_watch_sig = self.computeWorkspaceWatchSignature();
+        }
     }
 
     pub fn setAllFolderNodesExpanded(self: *EditorState, expanded: bool) void {
@@ -4382,6 +4692,10 @@ pub const EditorState = struct {
         self.doc.folder_src_skia = expanded;
         self.doc.folder_src_skia_c = expanded;
         self.doc.folder_examples = expanded;
+        self.workspace_tree_gen +%= 1;
+        if (self.has_opened_workspace and self.last_watch_sig != 0) {
+            self.last_watch_sig = self.computeWorkspaceWatchSignature();
+        }
     }
 
     pub fn expandFolderAndAncestors(self: *EditorState, folder_path: []const u8) void {

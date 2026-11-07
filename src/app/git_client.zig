@@ -112,7 +112,7 @@ pub fn parsePorcelainStatus(porcelain_out: []const u8, wfs: []const SampleFile, 
             raw_path = raw_path[arrow_idx + 4 ..];
         }
         const path = std.mem.trim(u8, raw_path, " \t\r\"");
-        for (wfs, 0..) |wf, idx| {
+        for (wfs, 0..) |*wf, idx| {
             if (idx >= out_statuses.len) break;
             if (wf.isSpecial()) continue;
             if (std.mem.eql(u8, wf.path, path) or

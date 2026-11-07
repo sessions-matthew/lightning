@@ -29,43 +29,218 @@ pub fn isPathVisibleInTree(state: *const EditorState, path: []const u8) bool {
     return ui.tree_view_mod.isPathVisibleInTree(path, state, isFolderCollapsed);
 }
 
-const FolderCountCache = struct {
-    file_count: usize = 0,
-    exact_counts: std.StringHashMapUnmanaged(usize) = .empty,
-    recursive_counts: std.StringHashMapUnmanaged(usize) = .empty,
+const ExplorerFlatNode = state_mod.ExplorerFlatNode;
 
-    fn build(arena: std.mem.Allocator, state: *const EditorState) *FolderCountCache {
-        const wfs = state.workspaceFiles();
-        const cache = arena.create(FolderCountCache) catch unreachable;
-        cache.* = .{ .file_count = wfs.len };
-        for (wfs) |file| {
-            if (file.isSpecial()) continue;
-            const folder = file.folder;
-            const exact_gop = cache.exact_counts.getOrPut(arena, folder) catch unreachable;
-            if (!exact_gop.found_existing) exact_gop.value_ptr.* = 0;
-            exact_gop.value_ptr.* += 1;
+const SubfolderRef = struct {
+    name: []const u8,
+    full_path: []const u8,
+    from_folder_list: bool,
+    item_idx: u32,
+    path_len: u16,
+};
 
-            const rec_gop = cache.recursive_counts.getOrPut(arena, folder) catch unreachable;
-            if (!rec_gop.found_existing) rec_gop.value_ptr.* = 0;
-            rec_gop.value_ptr.* += 1;
-
-            var cur = folder;
-            while (ui.tree_view_mod.parentDirPath(cur)) |ancestor| : (cur = ancestor) {
-                const anc_gop = cache.recursive_counts.getOrPut(arena, ancestor) catch unreachable;
-                if (!anc_gop.found_existing) anc_gop.value_ptr.* = 0;
-                anc_gop.value_ptr.* += 1;
-            }
-        }
-        return cache;
+fn computeExplorerTreeSignature(state: *const EditorState) u64 {
+    var h = std.hash.Fnv1a_64.init();
+    h.update(std.mem.asBytes(&state.file_count));
+    h.update(std.mem.asBytes(&state.folder_count));
+    h.update(std.mem.asBytes(&state.workspace_tree_gen));
+    h.update(std.mem.asBytes(&state.doc.folder_default_expanded));
+    h.update(std.mem.asBytes(&state.doc.collapsed_folder_count));
+    const cnt = @min(@as(usize, state.doc.collapsed_folder_count), state_mod.MaxCollapsedFolders);
+    if (cnt > 0) {
+        h.update(std.mem.sliceAsBytes(state.doc.collapsed_folder_hashes[0..cnt]));
     }
+    h.update(state.workspaceRoot());
+    const final_h = h.final();
+    return if (final_h == 0) 1 else final_h;
+}
 
-    fn count(self: *const FolderCountCache, prefix: []const u8, exact: bool) usize {
-        if (exact) {
-            return self.exact_counts.get(prefix) orelse 0;
+const TreeBuildScratch = struct {
+    seen_dirs: std.StringHashMapUnmanaged(void) = .empty,
+    child_subdirs: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(SubfolderRef)) = .empty,
+    folder_files: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty,
+    recursive_counts: std.StringHashMapUnmanaged(u32) = .empty,
+
+    fn registerFolderHierarchy(
+        self: *TreeBuildScratch,
+        arena: std.mem.Allocator,
+        full_folder_slice: []const u8,
+        from_folder_list: bool,
+        item_idx: u32,
+    ) void {
+        if (full_folder_slice.len == 0 or std.mem.eql(u8, full_folder_slice, ".")) return;
+        var cur_len: usize = full_folder_slice.len;
+        while (cur_len > 0) {
+            const cur_path = full_folder_slice[0..cur_len];
+            if (std.mem.eql(u8, cur_path, ".")) break;
+            const seen_gop = self.seen_dirs.getOrPut(arena, cur_path) catch return;
+            if (seen_gop.found_existing) break;
+
+            const slash_opt = std.mem.lastIndexOfScalar(u8, cur_path, '/');
+            const parent_path = if (slash_opt) |si| (if (si > 0) cur_path[0..si] else ".") else ".";
+            const sub_gop = self.child_subdirs.getOrPut(arena, parent_path) catch return;
+            if (!sub_gop.found_existing) {
+                sub_gop.value_ptr.* = .empty;
+            }
+            sub_gop.value_ptr.append(arena, .{
+                .name = ui.tree_view_mod.baseName(cur_path),
+                .full_path = cur_path,
+                .from_folder_list = from_folder_list,
+                .item_idx = item_idx,
+                .path_len = @intCast(@min(cur_len, std.math.maxInt(u16))),
+            }) catch {};
+
+            cur_len = slash_opt orelse 0;
         }
-        return self.recursive_counts.get(prefix) orelse 0;
     }
 };
+
+fn emitExplorerTreeRecursive(
+    state: *EditorState,
+    parent_folder: []const u8,
+    indent_level: usize,
+    scratch: *TreeBuildScratch,
+) void {
+    if (indent_level > 16) return;
+    const alloc = std.heap.c_allocator;
+    const wfs = state.workspaceFiles();
+
+    if (scratch.child_subdirs.getPtr(parent_folder)) |sub_list| {
+        const subdirs = sub_list.items;
+        if (subdirs.len > 1) {
+            var i: usize = 1;
+            while (i < subdirs.len) : (i += 1) {
+                const cur = subdirs[i];
+                var j: usize = i;
+                while (j > 0 and asciiLessThanIgnoreCase(cur.name, subdirs[j - 1].name)) : (j -= 1) {
+                    subdirs[j] = subdirs[j - 1];
+                }
+                subdirs[j] = cur;
+            }
+        }
+
+        for (subdirs) |sub| {
+            const sub_depth = ui.tree_view_mod.pathDepth(sub.full_path);
+            const rec_cnt = scratch.recursive_counts.get(sub.full_path) orelse 0;
+            var node = ExplorerFlatNode{
+                .is_folder = true,
+                .from_folder_list = sub.from_folder_list,
+                .depth = @intCast(@min(sub_depth, 16)),
+                .path_len = sub.path_len,
+                .item_idx = sub.item_idx,
+                .rec_file_count = rec_cnt,
+            };
+            if (std.fmt.bufPrint(&node.badge_buf, "{d}", .{rec_cnt})) |b_slice| {
+                node.badge_len = @intCast(b_slice.len);
+            } else |_| {}
+            state.cached_tree_nodes_list.append(alloc, node) catch {};
+
+            if (state.isFolderExpanded(sub.full_path)) {
+                emitExplorerTreeRecursive(state, sub.full_path, sub_depth + 1, scratch);
+            }
+        }
+    }
+
+    if (scratch.folder_files.getPtr(parent_folder)) |f_list| {
+        const matched_indices = f_list.items;
+        if (matched_indices.len > 1) {
+            var already_sorted = true;
+            for (1..matched_indices.len) |i| {
+                if (asciiLessThanIgnoreCase(wfs[matched_indices[i]].name, wfs[matched_indices[i - 1]].name)) {
+                    already_sorted = false;
+                    break;
+                }
+            }
+            if (!already_sorted) {
+                const SortCtx = struct {
+                    files: []const state_mod.SampleFile,
+                    pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                        return asciiLessThanIgnoreCase(ctx.files[a].name, ctx.files[b].name);
+                    }
+                };
+                std.mem.sort(u32, matched_indices, SortCtx{ .files = wfs }, SortCtx.lessThan);
+            }
+        }
+
+        for (matched_indices) |f_idx| {
+            state.cached_tree_nodes_list.append(alloc, .{
+                .is_folder = false,
+                .depth = @intCast(@min(indent_level, 16)),
+                .item_idx = f_idx,
+            }) catch {};
+        }
+    }
+}
+
+fn ensureExplorerTreeCache(state: *EditorState) []const ExplorerFlatNode {
+    const uic = &state.ui_ctx;
+    if (uic.pass == .input or state.cached_tree_sig == 0) {
+        const sig = computeExplorerTreeSignature(state);
+        if (state.cached_tree_sig != sig) {
+            state.cached_tree_nodes_list.clearRetainingCapacity();
+            const arena = uic.arena;
+            const wfs = state.workspaceFiles();
+            const wfolders = state.workspaceFolders();
+
+            var scratch = TreeBuildScratch{};
+            for (wfolders, 0..) |*dir_entry, d_idx| {
+                scratch.registerFolderHierarchy(arena, dir_entry.slice(), true, @intCast(d_idx));
+            }
+
+            var non_special: usize = 0;
+            var prev_folder: []const u8 = "";
+            var prev_folder_count: u32 = 0;
+            for (wfs, 0..) |*file, idx| {
+                if (file.isSpecial()) continue;
+                non_special += 1;
+                const folder = file.folder;
+                if (prev_folder.len == 0 or !std.mem.eql(u8, folder, prev_folder)) {
+                    if (prev_folder_count > 0 and !std.mem.eql(u8, prev_folder, ".") and prev_folder.len > 0) {
+                        if (scratch.recursive_counts.getOrPut(arena, prev_folder)) |rec_gop| {
+                            if (!rec_gop.found_existing) rec_gop.value_ptr.* = 0;
+                            rec_gop.value_ptr.* += prev_folder_count;
+                        } else |_| {}
+                        var cur = prev_folder;
+                        while (ui.tree_view_mod.parentDirPath(cur)) |ancestor| : (cur = ancestor) {
+                            const anc_gop = scratch.recursive_counts.getOrPut(arena, ancestor) catch break;
+                            if (!anc_gop.found_existing) anc_gop.value_ptr.* = 0;
+                            anc_gop.value_ptr.* += prev_folder_count;
+                        }
+                    }
+                    prev_folder = folder;
+                    prev_folder_count = 0;
+                    scratch.registerFolderHierarchy(arena, folder, false, @intCast(idx));
+                }
+                prev_folder_count += 1;
+
+                if (std.mem.eql(u8, folder, ".") or state.isFolderExpanded(folder)) {
+                    const f_gop = scratch.folder_files.getOrPut(arena, folder) catch continue;
+                    if (!f_gop.found_existing) {
+                        f_gop.value_ptr.* = .empty;
+                    }
+                    f_gop.value_ptr.append(arena, @intCast(idx)) catch {};
+                }
+            }
+            if (prev_folder_count > 0 and !std.mem.eql(u8, prev_folder, ".") and prev_folder.len > 0) {
+                if (scratch.recursive_counts.getOrPut(arena, prev_folder)) |rec_gop| {
+                    if (!rec_gop.found_existing) rec_gop.value_ptr.* = 0;
+                    rec_gop.value_ptr.* += prev_folder_count;
+                } else |_| {}
+                var cur = prev_folder;
+                while (ui.tree_view_mod.parentDirPath(cur)) |ancestor| : (cur = ancestor) {
+                    const anc_gop = scratch.recursive_counts.getOrPut(arena, ancestor) catch break;
+                    if (!anc_gop.found_existing) anc_gop.value_ptr.* = 0;
+                    anc_gop.value_ptr.* += prev_folder_count;
+                }
+            }
+
+            emitExplorerTreeRecursive(state, ".", 0, &scratch);
+            state.cached_non_special_file_count = non_special;
+            state.cached_tree_sig = sig;
+        }
+    }
+    return state.cached_tree_nodes_list.items;
+}
 
 pub fn build(
     state: *EditorState,
@@ -95,19 +270,16 @@ pub fn build(
     return action;
 }
 
-fn countFolderFiles(state: *EditorState, prefix: []const u8, exact: bool) usize {
-    const cache = state.ui_ctx.useFrameCache(FolderCountCache, "folder_counts", state, FolderCountCache.build);
-    if (cache.file_count != state.workspaceFiles().len) {
-        cache.* = FolderCountCache.build(state.ui_ctx.arena, state).*;
-    }
-    return cache.count(prefix, exact);
-}
-
-fn fileBadgeIcon(lang: ui.CodeLanguage, is_terminal: bool, is_agent: bool, is_preview: bool, is_waveform: bool, is_pdf: bool, is_image: bool, is_git_diff: bool) struct {
+fn fileBadgeIcon(lang: ui.CodeLanguage, is_terminal: bool, is_agent: bool, is_preview: bool, is_waveform: bool, is_pdf: bool, is_image: bool, is_audio: bool, is_video: bool, is_git_diff: bool, is_app: bool) struct {
     text: []const u8,
     color: u32,
     bg: u32,
 } {
+    if (is_app) return .{
+        .text = "APP",
+        .color = skia.Color.rgb(245, 158, 11),
+        .bg = skia.Color.argb(45, 245, 158, 11),
+    };
     if (is_agent) return .{
         .text = "✦",
         .color = skia.Color.rgb(88, 166, 255),
@@ -132,6 +304,16 @@ fn fileBadgeIcon(lang: ui.CodeLanguage, is_terminal: bool, is_agent: bool, is_pr
         .text = "PDF",
         .color = skia.Color.rgb(244, 63, 94),
         .bg = skia.Color.argb(45, 244, 63, 94),
+    };
+    if (is_video) return .{
+        .text = "VID",
+        .color = skia.Color.rgb(251, 146, 60),
+        .bg = skia.Color.argb(45, 251, 146, 60),
+    };
+    if (is_audio) return .{
+        .text = "AUD",
+        .color = skia.Color.rgb(192, 132, 252),
+        .bg = skia.Color.argb(45, 192, 132, 252),
     };
     if (is_image) return .{
         .text = "IMG",
@@ -173,248 +355,170 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-const SubfolderEntry = struct {
-    name: []const u8,
-    full_path: []const u8,
-};
-
-fn renderFolderFiles(
+fn renderWorkspaceTreeVirtual(
     state: *EditorState,
-    folder: []const u8,
-    exact: bool,
-    indent_level: usize,
     active_opt: ?usize,
     action: *ExplorerAction,
+    deferred_open_f_idx: *?usize,
 ) void {
     const uic = &state.ui_ctx;
-    const wfs = state.workspaceFiles();
-    var matched_indices_list: std.ArrayListUnmanaged(usize) = .empty;
+    const nodes = ensureExplorerTreeCache(state);
+    if (nodes.len == 0) return;
 
-    for (wfs, 0..) |file, idx| {
-        if (file.isSpecial()) continue;
-        const matches = if (exact)
-            std.mem.eql(u8, file.folder, folder)
-        else
-            (std.mem.eql(u8, file.folder, folder) or
-                (std.mem.startsWith(u8, file.folder, folder) and file.folder.len > folder.len and file.folder[folder.len] == '/'));
-        if (!matches) continue;
-        matched_indices_list.append(uic.arena, idx) catch {};
-    }
-
-    const matched_indices = matched_indices_list.items;
-    const match_count = matched_indices.len;
-
-    // Insertion-sort files alphabetically by filename (case-insensitive)
-    if (match_count > 1) {
-        var i: usize = 1;
-        while (i < match_count) : (i += 1) {
-            const cur_idx = matched_indices[i];
-            const cur_name = wfs[cur_idx].name;
-            var j: usize = i;
-            while (j > 0 and asciiLessThanIgnoreCase(cur_name, wfs[matched_indices[j - 1]].name)) : (j -= 1) {
-                matched_indices[j] = matched_indices[j - 1];
-            }
-            matched_indices[j] = cur_idx;
-        }
-    }
-
-    const rename_st_opt: ?*ExplorerInlineRenameState = if (uic.platform_ctx != null)
-        uic.useState(ExplorerInlineRenameState, "inline_rename", .{})
-    else
-        null;
-
-    for (matched_indices) |idx| {
-        const file = wfs[idx];
-        var item_id = uic.scopedId(idx + 10_000);
-        defer item_id.end();
-
-        const badge = fileBadgeIcon(file.language, file.is_terminal, file.is_agent, file.is_markdown_preview, file.is_waveform_preview or EditorState.isVcdCandidatePath(file.path), file.is_pdf_preview or EditorState.isPdfCandidatePath(file.path), EditorState.isImageCandidatePath(file.path), file.is_git_diff_preview);
-        const is_renaming_file = uic.latch(
-            bool,
-            rename_st_opt != null and rename_st_opt.?.renaming_file and rename_st_opt.?.target_file_idx == idx,
-        );
-        if (is_renaming_file) {
-            const rst = rename_st_opt.?;
-            switch (uic.treeInlineInputRow(
-                256,
-                "##explorer_rename_file_input",
-                indent_level,
-                badge.text,
-                badge.color,
-                &rst.input_buf,
-                "File name...",
-                .{},
-            )) {
-                .submitted, .cancelled => {
-                    rst.renaming_file = false;
-                },
-                .none => {},
-            }
-            continue;
-        }
-
-        const dirty = state.isFileDirty(idx);
-        const git_mod = state.isFileModifiedInGit(idx);
-        const sub_meta = if (!exact and file.folder.len > folder.len + 1)
-            file.folder[folder.len + 1 ..]
-        else if (dirty)
-            "M ●"
-        else if (git_mod)
-            "M"
-        else
-            "";
-
-        const item_res = uic.listItemEx(.{
-            .label = ui.tree_view_mod.baseName(file.path),
-            .meta = sub_meta,
-            .meta_color = if (dirty or git_mod) skia.Color.rgb(251, 191, 36) else null,
-            .icon_text = badge.text,
-            .icon_color = badge.color,
-            .icon_bg = badge.bg,
-            .selected = (active_opt != null and active_opt.? == idx),
-            .height = 23.0,
-            .indent_level = indent_level,
-        });
-        if (item_res.clicked) {
-            state.openFile(idx);
-            action.file_switched = true;
-        } else if (item_res.right_clicked) {
-            state.openContextMenu(.explorer_file, state.activePaneIndex(), idx, false);
-        }
-    }
-}
-
-/// Recursively builds the directory tree from `state.workspaceFolders()` and `state.workspaceFiles()`
-/// starting at `parent_folder` (`"."` for the workspace root), rendering sorted subdirectories first
-/// (including newly created empty directories) followed by sorted files.
-fn renderDirectoryTreeRecursive(
-    state: *EditorState,
-    parent_folder: []const u8,
-    indent_level: usize,
-    active_opt: ?usize,
-    action: *ExplorerAction,
-) void {
-    if (indent_level > 16) return;
-    const uic = &state.ui_ctx;
     const wfs = state.workspaceFiles();
     const wfolders = state.workspaceFolders();
-    const is_root = std.mem.eql(u8, parent_folder, ".");
-
-    var subdirs_list: std.ArrayListUnmanaged(SubfolderEntry) = .empty;
-
-    const addFolderCandidate = struct {
-        fn add(
-            arena: std.mem.Allocator,
-            folder_path: []const u8,
-            parent: []const u8,
-            root: bool,
-            list: *std.ArrayListUnmanaged(SubfolderEntry),
-        ) void {
-            if (std.mem.eql(u8, folder_path, ".") or folder_path.len == 0) return;
-            var rem: []const u8 = undefined;
-            if (root) {
-                rem = folder_path;
-            } else {
-                if (!std.mem.startsWith(u8, folder_path, parent)) return;
-                if (folder_path.len <= parent.len or folder_path[parent.len] != '/') return;
-                rem = folder_path[parent.len + 1 ..];
-            }
-            if (rem.len == 0) return;
-
-            const seg_len = std.mem.indexOfScalar(u8, rem, '/') orelse rem.len;
-            const child_full = if (root)
-                folder_path[0..seg_len]
-            else
-                folder_path[0 .. parent.len + 1 + seg_len];
-            const child_name = ui.tree_view_mod.baseName(child_full);
-
-            for (list.items) |existing| {
-                if (std.mem.eql(u8, existing.full_path, child_full)) return;
-            }
-            list.append(arena, .{
-                .name = child_name,
-                .full_path = child_full,
-            }) catch {};
-        }
-    }.add;
-
-    for (wfolders) |*dir_entry| {
-        addFolderCandidate(uic.arena, dir_entry.slice(), parent_folder, is_root, &subdirs_list);
-    }
-    var prev_file_folder: []const u8 = "";
-    for (wfs) |file| {
-        if (file.isSpecial()) continue;
-        if (prev_file_folder.len > 0 and std.mem.eql(u8, file.folder, prev_file_folder)) continue;
-        prev_file_folder = file.folder;
-        addFolderCandidate(uic.arena, file.folder, parent_folder, is_root, &subdirs_list);
-    }
-
-    const subdirs = subdirs_list.items;
-    const subdir_count = subdirs.len;
-
-    // Sort immediate subdirectories alphabetically (case-insensitive)
-    if (subdir_count > 1) {
-        var i: usize = 1;
-        while (i < subdir_count) : (i += 1) {
-            const cur = subdirs[i];
-            var j: usize = i;
-            while (j > 0 and asciiLessThanIgnoreCase(cur.name, subdirs[j - 1].name)) : (j -= 1) {
-                subdirs[j] = subdirs[j - 1];
-            }
-            subdirs[j] = cur;
-        }
-    }
 
     const rename_st_opt: ?*ExplorerInlineRenameState = if (uic.platform_ctx != null)
         uic.useState(ExplorerInlineRenameState, "inline_rename", .{})
     else
         null;
 
-    // 1. Render subdirectories recursively
-    for (subdirs) |sub| {
-        const sub_depth = ui.tree_view_mod.pathDepth(sub.full_path);
-        const sub_cnt = countFolderFiles(state, sub.full_path, false);
-        var exp = state.isFolderExpanded(sub.full_path);
-        const prev_exp = exp;
-        const is_renaming_dir = uic.latch(
-            bool,
-            rename_st_opt != null and rename_st_opt.?.renaming_folder and std.mem.eql(u8, rename_st_opt.?.target_folder.slice(), sub.full_path),
-        );
-        if (is_renaming_dir) {
-            const rst = rename_st_opt.?;
-            switch (uic.treeInlineInputRow(
-                256,
-                "##explorer_rename_folder_input",
-                sub_depth,
-                if (exp) "▾" else "▸",
-                skia.Color.rgb(96, 165, 250),
-                &rst.input_buf,
-                "Folder name...",
-                .{},
-            )) {
-                .submitted, .cancelled => {
-                    rst.renaming_folder = false;
-                },
-                .none => {},
+    const any_inline_rename = uic.latch(
+        bool,
+        rename_st_opt != null and (rename_st_opt.?.renaming_folder or rename_st_opt.?.renaming_file),
+    );
+    const vr = if (!any_inline_rename)
+        uic.computeVirtualRange(nodes.len, 28.0, 4)
+    else
+        ui.VirtualRange{
+            .first = 0,
+            .end = nodes.len,
+            .top_spacer_h = 0,
+            .bottom_spacer_h = 0,
+        };
+
+    if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+
+    for (nodes[vr.first..vr.end]) |node| {
+        if (node.is_folder) {
+            const full_path: []const u8 = if (node.from_folder_list) blk: {
+                if (node.item_idx >= wfolders.len) continue;
+                const dslice = wfolders[node.item_idx].slice();
+                break :blk dslice[0..@min(@as(usize, node.path_len), dslice.len)];
+            } else blk: {
+                if (node.item_idx >= wfs.len) continue;
+                const ffolder = wfs[node.item_idx].folder;
+                break :blk ffolder[0..@min(@as(usize, node.path_len), ffolder.len)];
+            };
+            const sub_name = ui.tree_view_mod.baseName(full_path);
+            const sub_depth: usize = node.depth;
+            var exp = state.isFolderExpanded(full_path);
+            const prev_exp = exp;
+
+            const is_renaming_dir = if (any_inline_rename)
+                uic.latch(
+                    bool,
+                    rename_st_opt != null and rename_st_opt.?.renaming_folder and std.mem.eql(u8, rename_st_opt.?.target_folder.slice(), full_path),
+                )
+            else
+                false;
+            if (is_renaming_dir) {
+                const rst = rename_st_opt.?;
+                switch (uic.treeInlineInputRow(
+                    256,
+                    "##explorer_rename_folder_input",
+                    sub_depth,
+                    if (exp) "▾" else "▸",
+                    skia.Color.rgb(96, 165, 250),
+                    &rst.input_buf,
+                    "Folder name...",
+                    .{},
+                )) {
+                    .submitted, .cancelled => {
+                        rst.renaming_folder = false;
+                    },
+                    .none => {},
+                }
+            } else {
+                const node_label = uic.fmt("{s}##dir_{s}", .{ sub_name, full_path });
+                const node_res = uic.treeFolderNodeEx(node_label, sub_depth, &exp, node.badgeSlice());
+                if (exp != prev_exp) {
+                    state.setFolderExpanded(full_path, exp);
+                }
+                if (node_res.right_clicked) {
+                    state.context_menu_folder.set(full_path);
+                    state.openContextMenu(.explorer_folder, state.activePaneIndex(), null, false);
+                }
             }
         } else {
-            const node_label = uic.fmt("{s}##dir_{s}", .{ sub.name, sub.full_path });
-            const node_res = uic.treeFolderNodeEx(node_label, sub_depth, &exp, uic.fmt("{d}", .{sub_cnt}));
-            if (exp != prev_exp) {
-                state.setFolderExpanded(sub.full_path, exp);
+            const idx: usize = node.item_idx;
+            if (idx >= wfs.len) continue;
+            const file = wfs[idx];
+            const indent_level: usize = node.depth;
+
+            var item_id = uic.scopedId(idx + 10_000);
+            defer item_id.end();
+
+            const badge = fileBadgeIcon(
+                file.language,
+                file.is_terminal,
+                file.is_agent,
+                file.is_markdown_preview,
+                file.is_waveform_preview or EditorState.isVcdCandidatePath(file.path),
+                file.is_pdf_preview or EditorState.isPdfCandidatePath(file.path),
+                EditorState.isImageCandidatePath(file.path),
+                EditorState.isAudioCandidatePath(file.path),
+                EditorState.isVideoCandidatePath(file.path),
+                file.is_git_diff_preview,
+                file.is_app_preview or EditorState.isAppCandidatePath(file.path),
+            );
+            const is_renaming_file = if (any_inline_rename)
+                uic.latch(
+                    bool,
+                    rename_st_opt != null and rename_st_opt.?.renaming_file and rename_st_opt.?.target_file_idx == idx,
+                )
+            else
+                false;
+            if (is_renaming_file) {
+                const rst = rename_st_opt.?;
+                switch (uic.treeInlineInputRow(
+                    256,
+                    "##explorer_rename_file_input",
+                    indent_level,
+                    badge.text,
+                    badge.color,
+                    &rst.input_buf,
+                    "File name...",
+                    .{},
+                )) {
+                    .submitted, .cancelled => {
+                        rst.renaming_file = false;
+                    },
+                    .none => {},
+                }
+                continue;
             }
-            if (node_res.right_clicked) {
-                state.context_menu_folder.set(sub.full_path);
-                state.openContextMenu(.explorer_folder, state.activePaneIndex(), null, false);
+
+            const dirty = state.isFileDirty(idx);
+            const git_mod = state.isFileModifiedInGit(idx);
+            const sub_meta = if (dirty)
+                "M ●"
+            else if (git_mod)
+                "M"
+            else
+                "";
+
+            const item_res = uic.listItemEx(.{
+                .label = file.name,
+                .meta = sub_meta,
+                .meta_color = if (dirty or git_mod) skia.Color.rgb(251, 191, 36) else null,
+                .icon_text = badge.text,
+                .icon_color = badge.color,
+                .icon_bg = badge.bg,
+                .selected = (active_opt != null and active_opt.? == idx),
+                .height = 24.0,
+                .indent_level = indent_level,
+            });
+            if (item_res.clicked) {
+                deferred_open_f_idx.* = idx;
+                action.file_switched = true;
+            } else if (item_res.right_clicked) {
+                state.openContextMenu(.explorer_file, state.activePaneIndex(), idx, false);
             }
-        }
-        if (exp) {
-            renderDirectoryTreeRecursive(state, sub.full_path, sub_depth + 1, active_opt, action);
         }
     }
 
-    // 2. Render files residing directly inside `parent_folder`
-    renderFolderFiles(state, parent_folder, true, indent_level, active_opt, action);
+    if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
 }
 
 fn buildExplorerView(
@@ -422,12 +526,19 @@ fn buildExplorerView(
     action: *ExplorerAction,
 ) void {
     const uic = &state.ui_ctx;
-    const active_opt = state.activeFileIndex();
     const wfs = state.workspaceFiles();
+    const raw_active_opt = state.activeFileIndex();
+    const has_active = uic.latch(bool, raw_active_opt != null and raw_active_opt.? < wfs.len);
+    const latched_active_idx = uic.latch(usize, if (raw_active_opt) |idx| idx else 0);
+    const active_opt: ?usize = if (has_active and wfs.len > 0) @min(latched_active_idx, wfs.len - 1) else null;
+
+    var deferred_open_f_idx: ?usize = null;
+    var deferred_kill_f_idx: ?usize = null;
+    var deferred_refresh_ws: bool = false;
 
     // 1. Collapsible OPEN BUFFERS Section (Emacs-style Buffer List across split windows)
-    const open_count = state.openBufferCount();
-    const pane_count = state.paneCount();
+    const open_count = @min(state.openBufferCount(), uic.latch(usize, state.openBufferCount()));
+    const pane_count = uic.latch(usize, state.paneCount());
     const open_badge = uic.fmt("{d}", .{open_count});
     if (uic.collapsibleSection("OPEN BUFFERS##sec_open", &state.doc.sec_open_editors, open_badge)) {
         if (open_count == 0) {
@@ -435,41 +546,37 @@ fn buildExplorerView(
         } else {
             for (0..open_count) |b_idx| {
                 const f_idx: usize = @as(usize, state.doc.open_buffers[b_idx]) % wfs.len;
-                const file = wfs[f_idx];
+                const file = &wfs[f_idx];
                 const dirty = state.isFileDirty(f_idx);
                 const is_selected = (active_opt != null and active_opt.? == f_idx);
                 const vis_pane = state.bufferVisibleInPane(f_idx);
-                const byte_len = if (state.loaded_from_disk[f_idx] or file.isSpecial() or dirty)
-                    state.buffers[f_idx].slice().len
-                else
-                    (EditorState.regularFileSizeOnDisk(file.path.ptr) orelse 0);
 
                 var open_id = uic.scopedId(b_idx + 1);
                 defer open_id.end();
 
-                const src_md_name = state.markdownPreviewSourceName(f_idx);
-                const src_wave_name = wfs[state.waveformPreviewSourceIndex()].name;
-                const src_diff_name = wfs[state.gitDiffPreviewSourceIndex()].name;
                 const meta_str = if (file.is_terminal)
                     (if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · zsh", .{vis_pane.? + 1}) else "zsh")
                 else if (file.is_agent)
                     (if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · agy", .{vis_pane.? + 1}) else "agy")
-                else if (file.is_markdown_preview)
-                    (if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · {s}", .{ vis_pane.? + 1, src_md_name }) else src_md_name)
-                else if (file.is_waveform_preview)
-                    (if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · {s}", .{ vis_pane.? + 1, src_wave_name }) else src_wave_name)
-                else if (file.is_pdf_preview)
+                else if (file.is_markdown_preview) blk: {
+                    const src_md_name = state.markdownPreviewSourceName(f_idx);
+                    break :blk if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · {s}", .{ vis_pane.? + 1, src_md_name }) else src_md_name;
+                } else if (file.is_waveform_preview) blk: {
+                    const src_wave_name = wfs[state.waveformPreviewSourceIndex()].name;
+                    break :blk if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · {s}", .{ vis_pane.? + 1, src_wave_name }) else src_wave_name;
+                } else if (file.is_pdf_preview)
                     (if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · PDF", .{vis_pane.? + 1}) else "PDF")
-                else if (file.is_git_diff_preview)
-                    (if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · {s}", .{ vis_pane.? + 1, src_diff_name }) else src_diff_name)
-                else if (pane_count > 1 and vis_pane != null)
+                else if (file.is_git_diff_preview) blk: {
+                    const src_diff_name = wfs[state.gitDiffPreviewSourceIndex()].name;
+                    break :blk if (pane_count > 1 and vis_pane != null) uic.fmt("W{d} · {s}", .{ vis_pane.? + 1, src_diff_name }) else src_diff_name;
+                } else if (pane_count > 1 and vis_pane != null)
                     (if (dirty) uic.fmt("* W{d}", .{vis_pane.? + 1}) else uic.fmt("W{d}", .{vis_pane.? + 1}))
-                else if (dirty)
-                    uic.fmt("* {d}B", .{byte_len})
-                else
-                    uic.fmt("{d}B", .{byte_len});
+                else blk: {
+                    const byte_len = state.fileByteSize(f_idx);
+                    break :blk if (dirty) uic.fmt("* {d}B", .{byte_len}) else uic.fmt("{d}B", .{byte_len});
+                };
 
-                const f_badge = fileBadgeIcon(file.language, file.is_terminal, file.is_agent, file.is_markdown_preview, file.is_waveform_preview or EditorState.isVcdCandidatePath(file.path), file.is_pdf_preview or EditorState.isPdfCandidatePath(file.path), EditorState.isImageCandidatePath(file.path), file.is_git_diff_preview);
+                const f_badge = fileBadgeIcon(file.language, file.is_terminal, file.is_agent, file.is_markdown_preview, file.is_waveform_preview or EditorState.isVcdCandidatePath(file.path), file.is_pdf_preview or EditorState.isPdfCandidatePath(file.path), EditorState.isImageCandidatePath(file.path), EditorState.isAudioCandidatePath(file.path), EditorState.isVideoCandidatePath(file.path), file.is_git_diff_preview, file.is_app_preview or EditorState.isAppCandidatePath(file.path));
                 const open_res = uic.listItemEx(.{
                     .label = file.name,
                     .meta = meta_str,
@@ -486,11 +593,9 @@ fn buildExplorerView(
                     .action_label = "×",
                 });
                 if (open_res.action_clicked) {
-                    state.killBuffer(f_idx);
-                    action.file_switched = true;
-                    return;
+                    deferred_kill_f_idx = f_idx;
                 } else if (open_res.clicked) {
-                    state.openFile(f_idx);
+                    deferred_open_f_idx = f_idx;
                     action.file_switched = true;
                 } else if (open_res.right_clicked) {
                     state.openContextMenu(.explorer_file, state.activePaneIndex(), f_idx, false);
@@ -500,7 +605,8 @@ fn buildExplorerView(
     }
 
     // 2. Collapsible Hierarchical WORKSPACE File Browser Tree with Manual Refresh (`↺`) Button
-    if (!state.hasOpenedWorkspace()) {
+    const has_opened_ws = uic.latch(bool, state.hasOpenedWorkspace());
+    if (!has_opened_ws) {
         if (uic.collapsibleSection("NO FOLDER OPENED##sec_no_folder", &state.doc.sec_files, "")) {
             var col = uic.column(.{
                 .padding = ui.Padding.xy(14, 10),
@@ -513,18 +619,19 @@ fn buildExplorerView(
             }
         }
     } else {
+        _ = ensureExplorerTreeCache(state);
         const ws_title = uic.fmt("WORKSPACE ({s})##sec_files", .{state.workspaceName()});
-        const files_badge = uic.fmt("{d}", .{state.nonSpecialFileCount()});
+        const files_badge = uic.fmt("{d}", .{state.cached_non_special_file_count});
         const ws_sec = uic.collapsibleSectionWithAction(ws_title, &state.doc.sec_files, files_badge, "↺");
         if (ws_sec.action_clicked) {
-            state.refreshWorkspaceFiles(true);
+            deferred_refresh_ws = true;
             action.file_switched = true;
         } else if (ws_sec.right_clicked) {
             state.context_menu_folder.set(".");
             state.openContextMenu(.explorer_folder, state.activePaneIndex(), null, false);
         }
         if (ws_sec.expanded) {
-            renderDirectoryTreeRecursive(state, ".", 0, active_opt, action);
+            renderWorkspaceTreeVirtual(state, active_opt, action, &deferred_open_f_idx);
         }
     }
 
@@ -543,14 +650,18 @@ fn buildExplorerView(
         const active_buf = if (is_scratch_md_prev) &state.scratch_buf else &state.buffers[outline_f_idx];
         const symbols = state.symbolsForFile(f_idx);
         const sym_count = symbols.len;
+        const latched_has_syms = uic.latch(bool, sym_count > 0);
+        const latched_is_md = uic.latch(bool, active_file.language == .markdown);
 
         const sym_badge = uic.fmt("{d}", .{sym_count});
         if (uic.collapsibleSection("OUTLINE##sec_outline", &state.doc.sec_outline, sym_badge)) {
-            if (sym_count == 0) {
+            if (!latched_has_syms or sym_count == 0) {
                 uic.label("No symbols in active file", null);
-            } else if (active_file.language == .markdown) {
+            } else if (latched_is_md) {
                 const cur_line = active_buf.cursorLineCol().line;
-                for (symbols, 0..) |sym, sidx| {
+                const vr = uic.computeVirtualRange(symbols.len, 27.0, 4);
+                if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+                for (symbols[vr.first..vr.end], vr.first..) |sym, sidx| {
                     var sym_id = uic.scopedId(sidx + 1000);
                     defer sym_id.end();
 
@@ -584,23 +695,29 @@ fn buildExplorerView(
                         state.openContextMenu(.outline_symbol, state.activePaneIndex(), outline_f_idx, false);
                     }
                 }
+                if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
             } else {
                 const cur_line = active_buf.cursorLineCol().line;
-                var fn_count: usize = 0;
-                var type_count: usize = 0;
-                for (symbols) |sym| {
+                var fn_indices: std.ArrayListUnmanaged(usize) = .empty;
+                var type_indices: std.ArrayListUnmanaged(usize) = .empty;
+                for (symbols, 0..) |sym, sidx| {
                     if (std.mem.eql(u8, sym.kind, "fn")) {
-                        fn_count += 1;
+                        fn_indices.append(uic.arena, sidx) catch {};
                     } else {
-                        type_count += 1;
+                        type_indices.append(uic.arena, sidx) catch {};
                     }
                 }
 
-                if (fn_count > 0) {
-                    const fn_meta = uic.fmt("{d}", .{fn_count});
+                const has_fn_syms = uic.latch(bool, fn_indices.items.len > 0);
+                if (has_fn_syms) {
+                    const fn_meta = uic.fmt("{d}", .{fn_indices.items.len});
                     if (uic.treeFolderNode("Functions##outline_fns", 0, &state.doc.outline_group_fn, fn_meta)) {
-                        for (symbols, 0..) |sym, sidx| {
-                            if (!std.mem.eql(u8, sym.kind, "fn")) continue;
+                        var fn_scope = uic.scopedId(1);
+                        defer fn_scope.end();
+                        const vr = uic.computeVirtualRange(fn_indices.items.len, 27.0, 4);
+                        if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+                        for (fn_indices.items[vr.first..vr.end]) |sidx| {
+                            const sym = symbols[sidx];
                             var sym_id = uic.scopedId(sidx + 1000);
                             defer sym_id.end();
 
@@ -626,14 +743,20 @@ fn buildExplorerView(
                                 state.openContextMenu(.outline_symbol, state.activePaneIndex(), f_idx, false);
                             }
                         }
+                        if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
                     }
                 }
 
-                if (type_count > 0) {
-                    const type_meta = uic.fmt("{d}", .{type_count});
+                const has_type_syms = uic.latch(bool, type_indices.items.len > 0);
+                if (has_type_syms) {
+                    const type_meta = uic.fmt("{d}", .{type_indices.items.len});
                     if (uic.treeFolderNode("Types & Constants##outline_types", 0, &state.doc.outline_group_types, type_meta)) {
-                        for (symbols, 0..) |sym, sidx| {
-                            if (std.mem.eql(u8, sym.kind, "fn")) continue;
+                        var type_scope = uic.scopedId(2);
+                        defer type_scope.end();
+                        const vr = uic.computeVirtualRange(type_indices.items.len, 27.0, 4);
+                        if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+                        for (type_indices.items[vr.first..vr.end]) |sidx| {
+                            const sym = symbols[sidx];
                             var sym_id = uic.scopedId(sidx + 1200);
                             defer sym_id.end();
 
@@ -659,10 +782,24 @@ fn buildExplorerView(
                                 state.openContextMenu(.outline_symbol, state.activePaneIndex(), f_idx, false);
                             }
                         }
+                        if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
                     }
                 }
             }
         }
+    }
+
+    if (deferred_kill_f_idx) |kill_idx| {
+        state.killBuffer(kill_idx);
+        action.file_switched = true;
+    }
+    if (deferred_open_f_idx) |open_idx| {
+        state.openFile(open_idx);
+        action.file_switched = true;
+    }
+    if (deferred_refresh_ws) {
+        state.refreshWorkspaceFiles(true);
+        action.file_switched = true;
     }
 }
 
@@ -690,7 +827,15 @@ fn buildSearchView(
 
     const wfs = state.workspaceFiles();
     const matches = state.workspaceSearchMatches();
-    for (matches) |*m| {
+    if (matches.len == 0) {
+        uic.label("No results.", null);
+        return;
+    }
+
+    const vr = uic.computeVirtualRange(matches.len, 28.0, 4);
+    if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+
+    for (matches[vr.first..vr.end]) |*m| {
         const f_idx: usize = @intCast(m.file_idx);
         if (f_idx >= wfs.len) continue;
         const file = wfs[f_idx];
@@ -745,9 +890,7 @@ fn buildSearchView(
         }
     }
 
-    if (matches.len == 0) {
-        uic.label("No results.", null);
-    }
+    if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
 }
 
 fn buildPluginsView(state: *EditorState) void {

@@ -2569,11 +2569,19 @@ fn renderHeading(
     const avail_w = @max(60.0, uic.availableWidth() - left_inset);
     const width_q: i32 = @intFromFloat(@round(avail_w * 4.0));
 
+    const extra_bottom: f32 = if (level <= 2) 4.0 else 0.0;
+    const est_lines = estimateWrappedLineCount(text, avail_w);
+    const est_h = @as(f32, @floatFromInt(est_lines)) * row_h + extra_bottom;
+
+    if (options.scroll_to_heading.len == 0 and !isBlockNearViewport(uic, est_h) and h.cached_width_q != width_q) {
+        _ = uic.nextRect(0, est_h);
+        return;
+    }
+
     if (h.cached_width_q != width_q or h.cached_height <= 0.0) {
         const spans = parseInlineSpans(uic.arena, text) catch &[_]InlineSpan{.{ .style = .plain, .text = text }};
         const wrapped = wrapInlineSpans(uic, spans, font, font_mono, avail_w);
         const line_count = @max(wrapped.len, 1);
-        const extra_bottom: f32 = if (level <= 2) 4.0 else 0.0;
         h.cached_width_q = width_q;
         h.cached_wrapped = wrapped;
         h.cached_height = @as(f32, @floatFromInt(line_count)) * row_h + extra_bottom;
@@ -3288,6 +3296,14 @@ fn renderTable(
     const avail_w = uic.availableWidth();
     const width_q: i32 = @intFromFloat(@round(avail_w * 4.0));
     const margin_bottom: f32 = 12.0;
+
+    const est_table_h: f32 = 34.0 + @as(f32, @floatFromInt(rows.len)) * 32.0;
+    if (!isBlockNearViewport(uic, est_table_h) and (tbl.cached_width_q != width_q or tbl.cached_height <= 0.0)) {
+        tbl.cached_width_q = width_q;
+        tbl.cached_height = est_table_h;
+        _ = uic.nextRect(0, est_table_h + margin_bottom);
+        return;
+    }
 
     if (uic.pass == .paint and tbl.cached_width_q == width_q and tbl.cached_height > 0.0) {
         const full_r_fast = uic.nextRect(0, tbl.cached_height + margin_bottom);

@@ -52,6 +52,8 @@ pub fn build(b: *std.Build) void {
         ui_mod.linkFramework("CoreGraphics", .{});
         ui_mod.linkFramework("CoreFoundation", .{});
         ui_mod.linkFramework("PDFKit", .{});
+        ui_mod.linkFramework("AVFoundation", .{});
+        ui_mod.linkFramework("CoreMedia", .{});
     }
 
     // `platform` module (C-ABI plugin boundary, StateStore, dylib hot-loader, macOS Metal / Win32 host)

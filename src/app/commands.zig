@@ -12,6 +12,9 @@ const EditorState = state_mod.EditorState;
 pub const Shortcut = ui.Shortcut;
 pub const containsIgnoreCase = ui.command_registry_mod.containsIgnoreCase;
 
+pub const tasks_mod = @import("tasks.zig");
+pub const keybindings_mod = @import("keybindings.zig");
+
 pub const Category = enum {
     view,
     file,
@@ -27,6 +30,8 @@ pub const Category = enum {
     developer,
     plugins,
     navigation,
+    tasks,
+    preferences,
 
     pub fn label(self: Category) []const u8 {
         return switch (self) {
@@ -44,11 +49,15 @@ pub const Category = enum {
             .developer => "Developer",
             .plugins => "Plugins",
             .navigation => "Go",
+            .tasks => "Tasks",
+            .preferences => "Preferences",
         };
     }
 };
 
 pub const CommandId = enum {
+    run_build_task,
+    run_task,
     command_palette,
     quick_open,
     supercomplete_toggle,
@@ -77,6 +86,9 @@ pub const CommandId = enum {
     open_pdf_preview_side,
     open_git_diff_preview,
     open_git_diff_preview_side,
+    open_app_preview,
+    open_app_preview_side,
+    select_app_preview_dylib,
     open_workspace_folder,
     refresh_workspace,
     split_right,
@@ -104,6 +116,8 @@ pub const CommandId = enum {
     goto_line_mode,
     open_user_plugins_folder,
     reload_all_plugins,
+    open_keybindings,
+    open_keybindings_json,
 };
 
 pub const CommandSpec = struct {
@@ -148,6 +162,23 @@ pub fn scoreQuery(cmd: CommandSpec, query: []const u8) ?i32 {
 /// Canonical command registry ordered so more-specific modifier combinations (`Shift+Cmd+...`, `Alt+Cmd+...`)
 /// precede base shortcuts (`Cmd+...`) for deterministic shortcut matching.
 pub const COMMANDS = [_]CommandSpec{
+    .{
+        .id = .run_build_task,
+        .label = "Tasks: Run Build Task",
+        .category = .tasks,
+        .shortcut_display = "Shift+Cmd+B",
+        .shortcut = .{ .key = .key_b, .cmd = true, .shift = true },
+        .icon_text = "⚡",
+    },
+    .{
+        .id = .run_task,
+        .label = "Tasks: Run Task",
+        .category = .tasks,
+        .shortcut_display = "",
+        .shortcut = null,
+        .icon_text = "⚡",
+        .show_in_palette = true,
+    },
     .{
         .id = .command_palette,
         .label = "View: Show Command Palette",
@@ -202,6 +233,9 @@ pub const COMMANDS = [_]CommandSpec{
     .{ .id = .open_pdf_preview_side, .label = "PDF: Open PDF Document Preview to the Side", .icon_text = "P" },
     .{ .id = .open_git_diff_preview, .label = "Git: Open Diff View Buffer", .icon_text = "D" },
     .{ .id = .open_git_diff_preview_side, .label = "Git: Open Diff View to the Side", .icon_text = "D" },
+    .{ .id = .open_app_preview, .label = "App: Open App Simulator Buffer", .icon_text = "⚡" },
+    .{ .id = .open_app_preview_side, .label = "App: Open App Simulator to the Side", .icon_text = "⚡" },
+    .{ .id = .select_app_preview_dylib, .label = "App: Select Preview App .dylib...", .icon_text = "📱" },
     .{
         .id = .open_workspace_folder,
         .label = "File: Open Workspace Folder...",
@@ -342,6 +376,19 @@ pub const COMMANDS = [_]CommandSpec{
         .label = "Plugins: Reload All Dynamic Plugins",
         .icon_text = "↺",
     },
+    .{
+        .id = .open_keybindings,
+        .label = "Preferences: Open Keyboard Shortcuts",
+        .category = .preferences,
+        .shortcut_display = "Cmd+K Cmd+S",
+        .icon_text = "⚙",
+    },
+    .{
+        .id = .open_keybindings_json,
+        .label = "Preferences: Open Keyboard Shortcuts (JSON)",
+        .category = .preferences,
+        .icon_text = "{}",
+    },
 };
 
 comptime {
@@ -354,8 +401,14 @@ comptime {
 }
 
 /// Evaluates all registered global shortcuts against `state.ui_ctx` during `Pass.input`
-/// and executes the matching command. Returns `true` if a shortcut was triggered.
+/// and executes the matching command. Uses the VS Code-compatible `KeybindingManager`
+/// with automatic chord handling (`Cmd+K Cmd+S`) and user overrides, falling back to
+/// the static `COMMANDS` table if the manager has not yet been initialized.
 pub fn dispatchGlobalShortcuts(state: *EditorState, active_bottom_tab: ?*u8) bool {
+    if (state.keybindings.bindings.items.len > 0) {
+        return state.keybindings.dispatch(state, active_bottom_tab);
+    }
+
     const uic = &state.ui_ctx;
     const term_focused = state.isTerminalFocused();
     for (COMMANDS) |spec| {
@@ -476,6 +529,12 @@ pub fn execute(
         .open_pdf_preview_side => state.openPdfPreviewBuffer(true),
         .open_git_diff_preview => state.openGitDiffPreviewBuffer(false),
         .open_git_diff_preview_side => state.openGitDiffPreviewBuffer(true),
+        .open_app_preview => state.openAppPreviewBuffer(false),
+        .open_app_preview_side => state.openAppPreviewBuffer(true),
+        .select_app_preview_dylib => {
+            state.openPaletteWithPrefix("app: ");
+            return;
+        },
         .open_workspace_folder => {
             state.openWorkspacePrompt();
             return;
@@ -573,6 +632,24 @@ pub fn execute(
         .reload_all_plugins => {
             _ = state.plugins.scanAndReloadPlugins(state, true);
             state.setStatusNotice("Scanned plugins (~/.lightning/plugins, zig-out/plugins)");
+        },
+        .run_build_task => {
+            tasks_mod.runBuildTask(state, active_bottom_tab);
+            return;
+        },
+        .run_task => {
+            state.doc.show_command_palette = true;
+            state.setPaletteQuery("> task:");
+            uic.focused_id = ui.id("workbench_palette_input");
+            return;
+        },
+        .open_keybindings => {
+            state.openKeybindingsView();
+            return;
+        },
+        .open_keybindings_json => {
+            state.openKeybindingsFile();
+            return;
         },
     }
 
@@ -893,7 +970,102 @@ test "commands: matchesQuery, scoreQuery, and matchShortcutInTable integration" 
     const idx_quick_open = ui.matchShortcutInTable(CommandSpec, &COMMANDS, .{ .key = .key_p, .cmd = true });
     try std.testing.expect(idx_quick_open != null);
     try std.testing.expectEqual(CommandId.quick_open, COMMANDS[idx_quick_open.?].id);
+
+    const idx_build = ui.matchShortcutInTable(CommandSpec, &COMMANDS, .{ .key = .key_b, .cmd = true, .shift = true });
+    try std.testing.expect(idx_build != null);
+    try std.testing.expectEqual(CommandId.run_build_task, COMMANDS[idx_build.?].id);
 }
+
+test "commands: vscode-like keybinding system and Command+Shift+B build execution" {
+    const platform_mod = @import("platform");
+
+    var store = platform_mod.StateStore.init(std.testing.allocator);
+    defer store.deinit();
+    var snap = platform_mod.SnapshotBuffer.init(std.testing.allocator);
+    defer snap.deinit();
+    var pctx = platform_mod.PlatformContext{ .width = 1280.0, .height = 800.0 };
+    pctx.bindHostStores(&store, &snap);
+
+    const state = try std.testing.allocator.create(EditorState);
+    defer std.testing.allocator.destroy(state);
+    state.* = .{
+        .frame_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .fonts = undefined,
+        .ui_ctx = undefined,
+    };
+    state.initResources(&pctx);
+    defer state.deinitResources();
+
+    // 1. Verify default Shift+Cmd+B is wired in keybindings manager
+    const build_kb = state.keybindings.findBindingForCommand(.run_build_task);
+    try std.testing.expect(build_kb != null);
+    try std.testing.expectEqual(platform_mod.KeyCode.key_b, build_kb.?.chord.first.key);
+    try std.testing.expect(build_kb.?.chord.first.cmd);
+    try std.testing.expect(build_kb.?.chord.first.shift);
+
+    try std.testing.expectEqualStrings("Shift+Cmd+B", state.shortcutDisplayForCommand(.run_build_task, ""));
+
+    // 2. Dispatching Cmd+Shift+B key event triggers run_build_task
+    var bottom_tab: u8 = 1; // start on Problems tab
+    state.vterm.headless_loopback = true;
+    state.ui_ctx.pass = .input;
+    const build_ev = [_]platform_mod.KeyEvent{.{
+        .key = .key_b,
+        .cmd = true,
+        .shift = true,
+    }};
+    state.ui_ctx.key_events = &build_ev;
+
+    const dispatched = dispatchGlobalShortcuts(state, &bottom_tab);
+    try std.testing.expect(dispatched);
+
+    // Verify build task executed:
+    // - Bottom panel / terminal is NOT brought up (runs quietly in background execution context)
+    // - Bottom panel tab routed to Output Console (2)
+    // - Tasks output channel filter activated
+    // - Task runner started in its own isolated subprocess execution context
+    // - Tasks output channel received initial task header
+    // - Status notice announced build execution
+    try std.testing.expect(!state.doc.show_bottom_panel);
+    try std.testing.expectEqual(@as(u8, 2), state.doc.bottom_panel_tab);
+    try std.testing.expectEqual(@as(u8, 2), bottom_tab);
+    try std.testing.expectEqualStrings("Tasks", state.output_channel_filter.slice());
+    try std.testing.expect(state.task_runner.is_running or state.task_runner.exit_code != null);
+    try std.testing.expect(state.output_line_count > 0);
+    var found_tasks_log = false;
+    for (state.output_lines[0..state.output_line_count]) |line| {
+        if (std.mem.eql(u8, line.channel.slice(), "Tasks")) {
+            found_tasks_log = true;
+            try std.testing.expect(std.mem.indexOf(u8, line.text.slice(), "zig build") != null);
+        }
+    }
+    try std.testing.expect(found_tasks_log);
+    try std.testing.expect(std.mem.indexOf(u8, state.status_notice.slice(), "Running task: zig build") != null);
+
+    // 3. User keybinding override via JSON: remap build task to Cmd+B
+    const user_override_json =
+        \\[
+        \\  {
+        \\    "key": "cmd+b",
+        \\    "command": "workbench.action.tasks.build"
+        \\  }
+        \\]
+    ;
+    _ = state.keybindings.loadFromJson(std.heap.c_allocator, user_override_json);
+    try std.testing.expectEqualStrings("Cmd+B", state.shortcutDisplayForCommand(.run_build_task, ""));
+
+    // Now Cmd+B executes build task instead of toggling sidebar
+    state.ui_ctx.pass = .input;
+    const custom_ev = [_]platform_mod.KeyEvent{.{
+        .key = .key_b,
+        .cmd = true,
+        .shift = false,
+    }};
+    state.ui_ctx.key_events = &custom_ev;
+    const dispatched_custom = dispatchGlobalShortcuts(state, &bottom_tab);
+    try std.testing.expect(dispatched_custom);
+}
+
 
 
 

@@ -50,6 +50,16 @@ INFO_PLIST_CONTENT = f"""<?xml version="1.0" encoding="UTF-8"?>
     <string>NSApplication</string>
     <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
     <false/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>An application running in Lightning terminal requires access to Bluetooth.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>An application running in Lightning terminal requires access to Bluetooth.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>An application running in Lightning terminal requires access to local network discovery.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>An application running in Lightning terminal requires access to the microphone.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>An application running in Lightning terminal requires access to the camera.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

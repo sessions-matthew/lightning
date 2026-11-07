@@ -98,6 +98,22 @@ pub fn isBinaryFileOnDisk(rel_path: []const u8) bool {
     return false;
 }
 
+pub fn isBinaryExtension(rel_path: []const u8) bool {
+    const binary_exts = [_][]const u8{
+        ".dylib",    ".a",        ".o",      ".bin",  ".so",    ".dll",   ".exe",   ".out",
+        ".icns",     ".ttf",      ".otf",    ".woff", ".woff2",
+        ".zip",      ".tar",      ".gz",     ".tgz",  ".bz2",   ".xz",    ".zst",   ".7z",    ".rar",
+        ".asif",     ".dmg",      ".iso",    ".img",  ".qcow2", ".vmdk",  ".elf",
+        ".axf",      ".pyc",      ".class",  ".wasm", ".rlib",  ".rmeta", ".db",    ".sqlite", ".keystore",
+        ".docx",     ".pptx",     ".xlsx",   ".pages", ".key",  ".numbers",
+        ".mp3",      ".wav",      ".flac",   ".ogg",  ".m4a",   ".mp4",   ".mov",   ".mkv",   ".avi",   ".webm",
+    };
+    for (binary_exts) |ext| {
+        if (std.ascii.endsWithIgnoreCase(rel_path, ext)) return true;
+    }
+    return false;
+}
+
 pub fn shouldIgnoreScannedPath(rel_path: []const u8) bool {
     if (rel_path.len == 0 or rel_path.len >= 254) return true;
     if (std.mem.startsWith(u8, rel_path, "vendor/") or
@@ -108,38 +124,13 @@ pub fn shouldIgnoreScannedPath(rel_path: []const u8) bool {
     {
         return true;
     }
-    const binary_exts = [_][]const u8{
-        ".dylib",    ".a",        ".o",      ".d",    ".bin",  ".map",   ".so",    ".dll",   ".exe",   ".out",
-        ".icns",     ".ttf",      ".otf",    ".woff", ".woff2",
-        ".zip",      ".tar",      ".gz",     ".asif", ".dmg",  ".iso",   ".img",   ".qcow2", ".vmdk",  ".elf",
-        ".axf",      ".hex",      ".pyc",    ".class", ".wasm", ".rlib", ".rmeta", ".db",    ".sqlite", ".keystore",
-        ".DS_Store", ".icloud",
-    };
-    for (binary_exts) |ext| {
-        if (std.mem.endsWith(u8, rel_path, ext)) return true;
+    const base = std.fs.path.basename(rel_path);
+    if (std.mem.eql(u8, base, ".DS_Store") or
+        std.mem.endsWith(u8, base, ".icloud") or
+        std.mem.endsWith(u8, base, ".editor_tmp"))
+    {
+        return true;
     }
-    if (isImageCandidatePath(rel_path)) {
-        return false;
-    }
-    // Known source-code and plain-text extensions do not need a 256-byte binary header read on disk
-    if (detectLanguageForPath(rel_path) != .plain) {
-        return false;
-    }
-    const text_exts = [_][]const u8{
-        ".txt",      ".readme",     ".xml",          ".ccxml",        ".project",
-        ".cproject", ".ccsproject", ".html",         ".css",          ".p",
-        ".lst",      ".toml",       ".yaml",         ".yml",          ".ini",
-        ".conf",     ".cmake",      ".url",          ".vcd",          ".csv",
-        ".pdf",      ".PDF",        ".log",          ".sh",           ".svd",
-        ".ld",       ".lds",        ".inc",          ".def",          ".cfg",
-        ".mk",       ".lic",        ".do",           ".tcl",          ".sdc",
-        ".xdc",      ".ucf",        ".qsf",          ".pcf",          ".gitignore",
-        ".gitattributes", ".editorconfig", ".env",
-    };
-    for (text_exts) |ext| {
-        if (std.mem.endsWith(u8, rel_path, ext)) return false;
-    }
-    if (isBinaryFileOnDisk(rel_path)) return true;
     return false;
 }
 
@@ -348,6 +339,18 @@ pub fn isImageCandidatePath(path: []const u8) bool {
     return ui.isImagePath(path);
 }
 
+pub fn isAudioCandidatePath(path: []const u8) bool {
+    return ui.isAudioPath(path);
+}
+
+pub fn isVideoCandidatePath(path: []const u8) bool {
+    return ui.isVideoPath(path);
+}
+
+pub fn isMediaCandidatePath(path: []const u8) bool {
+    return isAudioCandidatePath(path) or isVideoCandidatePath(path);
+}
+
 pub fn folderPathHash(folder_path: []const u8) u64 {
     const h = std.hash.Wyhash.hash(0xF01D_E29A_C357_1101, folder_path);
     return if (h == 0) 1 else h;
@@ -429,8 +432,15 @@ test "workspace_fs: directory filtering, binary content checks, mtime, and candi
     try std.testing.expect(isSupportedWorkspaceFile("src/app/state.zig"));
     try std.testing.expect(isSupportedWorkspaceFile("archive/tb_popcnt.do"));
     try std.testing.expect(isSupportedWorkspaceFile("scripts/synth.tcl"));
+    try std.testing.expect(isSupportedWorkspaceFile("docs/report.docx"));
+    try std.testing.expect(isSupportedWorkspaceFile("slides/lecture.pptx"));
+    try std.testing.expect(isSupportedWorkspaceFile("hw3/submission.zip"));
+    try std.testing.expect(isSupportedWorkspaceFile("fw/image.bin"));
+    try std.testing.expect(isSupportedWorkspaceFile("fw/boot.elf"));
+    try std.testing.expect(isSupportedWorkspaceFile("data/results.sqlite"));
     try std.testing.expect(!isSupportedWorkspaceFile("zig-out/lib/libeditor_app.dylib"));
     try std.testing.expect(!isSupportedWorkspaceFile(".git/HEAD"));
+    try std.testing.expect(!isSupportedWorkspaceFile(".DS_Store"));
 
     try std.testing.expect(isBinaryContent(&.{ 0xCF, 0xFA, 0xED, 0xFE, 0x01 }));
     try std.testing.expect(isBinaryContent("hello\x00world"));
@@ -445,6 +455,18 @@ test "workspace_fs: directory filtering, binary content checks, mtime, and candi
     try std.testing.expect(isImageCandidatePath("out/frame.ppm"));
     try std.testing.expect(isSupportedWorkspaceFile("plots/waveform.png"));
     try std.testing.expect(!isImageCandidatePath("src/main.zig"));
+
+    try std.testing.expect(isAudioCandidatePath("audio/podcast.mp3"));
+    try std.testing.expect(isAudioCandidatePath("sounds/effect.wav"));
+    try std.testing.expect(isAudioCandidatePath("music/track.flac"));
+    try std.testing.expect(!isAudioCandidatePath("src/main.zig"));
+
+    try std.testing.expect(isVideoCandidatePath("videos/demo.mp4"));
+    try std.testing.expect(isVideoCandidatePath("media/clip.mov"));
+    try std.testing.expect(isVideoCandidatePath("streams/output.webm"));
+    try std.testing.expect(!isVideoCandidatePath("src/main.zig"));
+    try std.testing.expect(isMediaCandidatePath("videos/demo.mp4"));
+    try std.testing.expect(isMediaCandidatePath("audio/podcast.mp3"));
 
     try std.testing.expect(isWaveformCandidatePath("sim/trace.vcd"));
     try std.testing.expect(isWaveformCandidatePath("rtl/top.sv"));

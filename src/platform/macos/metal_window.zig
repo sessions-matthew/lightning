@@ -26,6 +26,16 @@ export const embedded_info_plist linksection("__TEXT,__info_plist") =
     \\    <true/>
     \\    <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
     \\    <false/>
+    \\    <key>NSBluetoothAlwaysUsageDescription</key>
+    \\    <string>An application running in Lightning terminal requires access to Bluetooth.</string>
+    \\    <key>NSBluetoothPeripheralUsageDescription</key>
+    \\    <string>An application running in Lightning terminal requires access to Bluetooth.</string>
+    \\    <key>NSLocalNetworkUsageDescription</key>
+    \\    <string>An application running in Lightning terminal requires access to local network discovery.</string>
+    \\    <key>NSMicrophoneUsageDescription</key>
+    \\    <string>An application running in Lightning terminal requires access to the microphone.</string>
+    \\    <key>NSCameraUsageDescription</key>
+    \\    <string>An application running in Lightning terminal requires access to the camera.</string>
     \\</dict>
     \\</plist>
 .*;
@@ -205,6 +215,9 @@ pub fn run(config: Config) !void {
         metrics_collector.deinit();
     }
 
+    var debug_server = profiler.LiveDebugServer.init(std.heap.c_allocator);
+    defer debug_server.deinit();
+
     const scenario = if (config.scenario) |s| profiler.ScenarioKind.fromString(s) else .none;
     const effective_max_frames: ?usize = config.max_frames orelse if (config.bench) 300 else null;
 
@@ -254,7 +267,7 @@ pub fn run(config: Config) !void {
 
     // 4. Event-Driven Idle-Sleeping & Partial Scissor Render Loop
     while (true) {
-        const t_frame_start = profiler.nowNs();
+        var t_frame_start = profiler.nowNs();
         const frame_pool = objc.objc_autoreleasePoolPush();
         defer objc.objc_autoreleasePoolPop(frame_pool);
 
@@ -271,8 +284,9 @@ pub fn run(config: Config) !void {
 
         const now = objc.CFAbsoluteTimeGetCurrent();
         const elapsed = now - last_frame_time;
+        const is_sleeping_wait = should_sleep or (elapsed < min_frame_interval and effective_max_frames == null and !config.bench);
         var wait_until = if (should_sleep)
-            objc.msgSend1(NSDate, objc.id, "dateWithTimeIntervalSinceNow:", @as(f64, 1.0))
+            objc.msgSend1(NSDate, objc.id, "dateWithTimeIntervalSinceNow:", @as(f64, 0.25))
         else if (elapsed < min_frame_interval and effective_max_frames == null and !config.bench)
             objc.msgSend1(NSDate, objc.id, "dateWithTimeIntervalSinceNow:", min_frame_interval - elapsed)
         else
@@ -292,7 +306,8 @@ pub fn run(config: Config) !void {
         const NSWindowClass = objc.objc_getClass("NSWindow");
         const my_win_num = objc.msgSend0(window, isize, "windowNumber");
 
-        const t_events_start = profiler.nowNs();
+        var t_events_start = profiler.nowNs();
+        var first_event_wait = is_sleeping_wait;
         while (true) {
             const event = objc.msgSend4(
                 app,
@@ -303,6 +318,12 @@ pub fn run(config: Config) !void {
                 objc.NSDefaultRunLoopMode,
                 true,
             );
+            if (first_event_wait) {
+                first_event_wait = false;
+                const t_woke = profiler.nowNs();
+                t_frame_start = t_woke;
+                t_events_start = t_woke;
+            }
             if (event == null) break;
 
             // Subsequent iterations drain remaining queued events without blocking
@@ -437,6 +458,10 @@ pub fn run(config: Config) !void {
         const t_events_end = profiler.nowNs();
         const events_ns = t_events_end - t_events_start;
         trace_collector.record("AppKit.Events", "event", t_events_start, t_events_end);
+
+        if (debug_server.poll(&ctx, &metrics_collector, &trace_collector)) {
+            redraw_frames_remaining = @max(redraw_frames_remaining, 2);
+        }
 
         if (!objc.msgSend0(window, bool, "isVisible")) break;
         if (effective_max_frames) |limit| {
@@ -599,6 +624,7 @@ pub fn run(config: Config) !void {
         // If Pass 1 (.input) determined nothing visually changed (e.g. mouse moved over empty space),
         // skip acquiring a CAMetalDrawable and skip GPU submission completely!
         if (!did_paint and effective_max_frames == null) {
+            metrics_collector.recordIdleWakeup(&ctx);
             last_frame_time = objc.CFAbsoluteTimeGetCurrent();
             continue;
         }
@@ -732,7 +758,14 @@ fn handleMacKeyDown(ctx: *app_api.PlatformContext, event: objc.id) bool {
         17 => if (cmd or ctrl) .key_t else .none,
         18 => if (cmd or ctrl) .key_1 else .none,
         19 => if (cmd or ctrl) .key_2 else .none,
+        20 => if (cmd or ctrl) .key_3 else .none,
+        21 => if (cmd or ctrl) .key_4 else .none,
+        23 => if (cmd or ctrl) .key_5 else .none,
         22 => if (cmd or ctrl) .key_6 else .none,
+        26 => if (cmd or ctrl) .key_7 else .none,
+        28 => if (cmd or ctrl) .key_8 else .none,
+        25 => if (cmd or ctrl) .key_9 else .none,
+        29 => if (cmd or ctrl) .key_0 else .none,
         27 => if (cmd or ctrl) .key_minus else .none,
         30 => if (cmd or ctrl) .key_rbracket else .none,
         31 => if (cmd or ctrl) .key_o else .none,
@@ -748,10 +781,18 @@ fn handleMacKeyDown(ctx: *app_api.PlatformContext, event: objc.id) bool {
         45 => if (cmd or ctrl) .key_n else .none,
         46 => if (cmd or ctrl) .key_m else .none,
         49 => if (cmd or ctrl) .key_space else .none,
+        122 => .f1,
+        120 => .f2,
+        99 => .f3,
+        118 => .f4,
         96 => .f5,
+        97 => .f6,
+        98 => .f7,
+        100 => .f8,
         101 => .f9,
         109 => .f10,
         103 => .f11,
+        111 => .f12,
         else => .none,
     };
 

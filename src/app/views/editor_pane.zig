@@ -7,6 +7,7 @@ const skia = @import("skia");
 const ui = @import("ui");
 const state_mod = @import("../state.zig");
 const commands = @import("../commands.zig");
+const tasks_mod = @import("../tasks.zig");
 const bottom_panel = @import("bottom_panel.zig");
 const agent_panel = @import("agent_panel.zig");
 const modals = @import("modals.zig");
@@ -45,7 +46,7 @@ pub fn build(state: *EditorState) void {
     var scope = uic.scopedState("editor_pane");
     defer scope.end();
 
-    const active_panel_tab = uic.useState(u8, "bottom_panel_tab", 0);
+    const active_panel_tab = &state.doc.bottom_panel_tab;
 
     // Sync active pane if the user clicked inside any split pane or focused its editor widget
     const cur_pane_count = state.paneCount();
@@ -343,6 +344,82 @@ fn buildEditorGroupPane(
                     const msg = std.fmt.bufPrint(&notice_buf, "Copied pixel color {s} to clipboard", .{hex_col}) catch "Copied pixel color";
                     state.setStatusNotice(msg);
                     uic.invalidateWindow();
+                }
+                if (uic.pass == .input and uic.mouse_pressed and uic.isHovered(code_row.rect)) {
+                    activatePane(state, pane_idx);
+                }
+            } else if (EditorState.isAudioCandidatePath(active_file.path)) {
+                const aud_id = switch (@min(pane_idx, 3)) {
+                    0 => "workbench_audio_player_0",
+                    1 => "workbench_audio_player_1",
+                    2 => "workbench_audio_player_2",
+                    else => "workbench_audio_player_3",
+                };
+                const aud_slot = @min(pane_idx, state_mod.MaxEditorPanes - 1);
+                const aud_view: *ui.AudioPlayerState = if (uic.platform_ctx != null)
+                    uic.useState(ui.AudioPlayerState, uic.fmt("workbench_aud_state_{d}_{d}", .{ pane_idx, file_idx }), .{})
+                else
+                    &state.audio_views[aud_slot];
+                const aud_res = uic.audioPlayer(aud_id, 0.0, code_area_h, aud_view, .{
+                    .file_path = active_file.path,
+                    .raw_bytes = active_buf.slice(),
+                });
+                state.audio_views[aud_slot] = aud_view.*;
+                if (aud_res.needs_continuous_redraw) {
+                    if (uic.platform_ctx) |pctx| pctx.needs_continuous_redraw = true;
+                }
+                if (uic.pass == .input and uic.mouse_pressed and uic.isHovered(code_row.rect)) {
+                    activatePane(state, pane_idx);
+                }
+            } else if (EditorState.isVideoCandidatePath(active_file.path)) {
+                const vid_id = switch (@min(pane_idx, 3)) {
+                    0 => "workbench_video_player_0",
+                    1 => "workbench_video_player_1",
+                    2 => "workbench_video_player_2",
+                    else => "workbench_video_player_3",
+                };
+                const vid_slot = @min(pane_idx, state_mod.MaxEditorPanes - 1);
+                // Always use `state.video_views[slot]` directly as the authoritative VideoPlayerState.
+                // Using `useState` keyed on `file_idx` is unsafe: file indices shift when the workspace
+                // file list changes (files added/removed), leaving `native_generator_handle` pointing at
+                // a retained ObjC object owned by a stale state slot that then gets extracted from.
+                const vid_view = &state.video_views[vid_slot];
+                const vid_res = uic.videoPlayer(vid_id, 0.0, code_area_h, vid_view, .{
+                    .file_path = active_file.path,
+                    .raw_bytes = active_buf.slice(),
+                });
+                // `vid_view` is already a pointer into `state.video_views[vid_slot]`; no copy needed.
+                _ = vid_res.needs_continuous_redraw; // suppress unused warning
+                if (vid_res.needs_continuous_redraw) {
+                    if (uic.platform_ctx) |pctx| pctx.needs_continuous_redraw = true;
+                }
+                if (uic.pass == .input and uic.mouse_pressed and uic.isHovered(code_row.rect)) {
+                    activatePane(state, pane_idx);
+                }
+            } else if (active_file.is_app_preview or EditorState.isAppCandidatePath(active_file.path)) {
+                const is_direct_dylib = !active_file.is_app_preview and EditorState.isAppCandidatePath(active_file.path);
+                var detected_buf: [512]u8 = undefined;
+                const detected_dylib = if (!is_direct_dylib) tasks_mod.detectPreviewAppDylib(state, &detected_buf) else null;
+                const dylib_path = if (is_direct_dylib)
+                    active_file.path
+                else if (detected_dylib) |dp|
+                    dp
+                else
+                    "";
+
+                const app_id = switch (@min(pane_idx, 3)) {
+                    0 => "workbench_app_sim_0",
+                    1 => "workbench_app_sim_1",
+                    2 => "workbench_app_sim_2",
+                    else => "workbench_app_sim_3",
+                };
+                const app_slot = @min(pane_idx, state_mod.MaxEditorPanes - 1);
+                const sim = &state.app_views[app_slot];
+                const app_res = uic.appSimulator(app_id, 0.0, code_area_h, sim, .{
+                    .dylib_path = dylib_path,
+                });
+                if (app_res.needs_continuous_redraw) {
+                    if (uic.platform_ctx) |pctx| pctx.needs_continuous_redraw = true;
                 }
                 if (uic.pass == .input and uic.mouse_pressed and uic.isHovered(code_row.rect)) {
                     activatePane(state, pane_idx);
@@ -654,6 +731,8 @@ fn drawEmacsModeLine(
             ml.drawBadgePill("[PDF]", skia.Color.rgb(251, 146, 60), skia.Color.argb(45, 249, 115, 22), null);
         } else if (file.is_git_diff_preview) {
             ml.drawBadgePill("[DIFF]", skia.Color.rgb(129, 140, 248), skia.Color.argb(45, 99, 102, 241), null);
+        } else if (file.is_app_preview or EditorState.isAppCandidatePath(file.path)) {
+            ml.drawBadgePill("[APP]", skia.Color.rgb(245, 158, 11), skia.Color.argb(45, 217, 119, 6), null);
         } else if (file.is_terminal) {
             ml.drawBadgePill("[TERM]", skia.Color.rgb(52, 211, 153), skia.Color.argb(45, 16, 185, 129), null);
         } else if (file.is_agent) {
@@ -729,8 +808,14 @@ fn drawEmacsModeLine(
             uic.fmt("(PDF · Pg {d})", .{state.pdf_views[@min(pane_idx, state_mod.MaxEditorPanes - 1)].current_page + 1})
         else if (EditorState.isImageCandidatePath(file.path))
             uic.fmt("(Image · {d}%)", .{@as(u32, @intFromFloat(@round(state.image_views[@min(pane_idx, state_mod.MaxEditorPanes - 1)].zoom * 100.0)))})
+        else if (EditorState.isAudioCandidatePath(file.path))
+            uic.fmt("(Audio · {s})", .{state.audio_views[@min(pane_idx, state_mod.MaxEditorPanes - 1)].statusLabel()})
+        else if (EditorState.isVideoCandidatePath(file.path))
+            uic.fmt("(Video · {s})", .{state.video_views[@min(pane_idx, state_mod.MaxEditorPanes - 1)].statusLabel()})
         else if (file.is_git_diff_preview)
             uic.fmt("(Diff · {s})", .{wfs[state.gitDiffPreviewSourceIndex()].name})
+        else if (file.is_app_preview or EditorState.isAppCandidatePath(file.path))
+            uic.fmt("(App · {s})", .{state.app_views[@min(pane_idx, state_mod.MaxEditorPanes - 1)].label()})
         else if (is_wrapped)
             (if (std.mem.eql(u8, file.folder, ".")) uic.fmt("({s} · Wrap)", .{mode_name}) else uic.fmt("({s} · Wrap · {s})", .{ mode_name, file.folder }))
         else if (std.mem.eql(u8, file.folder, "."))

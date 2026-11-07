@@ -292,88 +292,135 @@ pub fn filePickerModal(
     else
         cwd_slice;
 
-    var browse_dir: []const u8 = cwd_slice;
-    var filter_prefix: []const u8 = "";
+    const PickerScanCache = struct {
+        browse_dir: []const u8 = "",
+        entries: []const FilePickerEntry = &.{},
 
-    if (checkPathIsDir(expanded)) {
-        var clean = expanded;
-        while (clean.len > 1 and clean[clean.len - 1] == '/') {
-            clean = clean[0 .. clean.len - 1];
-        }
-        browse_dir = clean;
-    } else if (std.fs.path.dirname(expanded)) |parent| {
-        const eff_parent = if (parent.len == 0) "." else parent;
-        if (checkPathIsDir(eff_parent)) {
-            browse_dir = eff_parent;
-            filter_prefix = std.fs.path.basename(expanded);
-        }
-    }
+        const ScanCtx = struct {
+            expanded: []const u8,
+            cwd_slice: []const u8,
+            show_files: bool,
+        };
 
-    var entries: [96]FilePickerEntry = undefined;
-    var entry_count: usize = 0;
+        fn build(arena: std.mem.Allocator, sctx: ScanCtx) *@This() {
+            var b_dir: []const u8 = sctx.cwd_slice;
+            var f_prefix: []const u8 = "";
 
-    if (filter_prefix.len == 0) {
-        if (std.fs.path.dirname(browse_dir)) |parent_dir| {
-            if (!std.mem.eql(u8, parent_dir, browse_dir)) {
-                entries[entry_count] = .{
-                    .name = ".. (Parent Directory)",
-                    .full_path = uic.arena.dupe(u8, parent_dir) catch parent_dir,
-                    .is_dir = true,
-                    .is_parent = true,
-                };
-                entry_count += 1;
+            if (checkPathIsDir(sctx.expanded)) {
+                var clean = sctx.expanded;
+                while (clean.len > 1 and clean[clean.len - 1] == '/') {
+                    clean = clean[0 .. clean.len - 1];
+                }
+                b_dir = clean;
+            } else if (std.fs.path.dirname(sctx.expanded)) |parent| {
+                const eff_parent = if (parent.len == 0) "." else parent;
+                if (checkPathIsDir(eff_parent)) {
+                    b_dir = eff_parent;
+                    f_prefix = std.fs.path.basename(sctx.expanded);
+                }
             }
-        }
-    }
 
-    if (browse_dir.len > 0 and browse_dir.len < 500) {
-        var dir_z: [512:0]u8 = @splat(0);
-        @memcpy(dir_z[0..browse_dir.len], browse_dir);
-        dir_z[browse_dir.len] = 0;
-        if (platform.fs_util.opendir(&dir_z)) |dirp| {
-            defer _ = platform.fs_util.closedir(dirp);
-            const show_hidden = (filter_prefix.len > 0 and filter_prefix[0] == '.');
-            while (platform.fs_util.readdir(dirp)) |ent| {
-                if (entry_count >= entries.len) break;
-                const name_raw = platform.fs_util.direntName(ent);
-                if (name_raw.len == 0 or std.mem.eql(u8, name_raw, ".") or std.mem.eql(u8, name_raw, "..")) continue;
-                if (!show_hidden and name_raw[0] == '.') continue;
-                if (filter_prefix.len > 0 and !root.containsIgnoreCase(name_raw, filter_prefix)) continue;
+            var list = arena.alloc(FilePickerEntry, 96) catch unreachable;
+            var cnt: usize = 0;
 
-                const joined = if (std.mem.eql(u8, browse_dir, "/"))
-                    (std.fmt.allocPrint(uic.arena, "/{s}", .{name_raw}) catch continue)
-                else if (std.mem.eql(u8, browse_dir, "."))
-                    (uic.arena.dupe(u8, name_raw) catch continue)
-                else
-                    (std.fmt.allocPrint(uic.arena, "{s}/{s}", .{ browse_dir, name_raw }) catch continue);
-
-                const is_dir = if (ent.d_type == platform.fs_util.DT_DIR)
-                    true
-                else if (ent.d_type == platform.fs_util.DT_REG)
-                    false
-                else
-                    checkPathIsDir(joined);
-                if (!is_dir and !config.show_files) continue;
-
-                const disp_name = if (is_dir)
-                    (std.fmt.allocPrint(uic.arena, "{s}/", .{name_raw}) catch continue)
-                else
-                    (uic.arena.dupe(u8, name_raw) catch continue);
-
-                entries[entry_count] = .{
-                    .name = disp_name,
-                    .full_path = joined,
-                    .is_dir = is_dir,
-                    .is_parent = false,
-                };
-                entry_count += 1;
+            if (f_prefix.len == 0) {
+                if (std.fs.path.dirname(b_dir)) |parent_dir| {
+                    if (!std.mem.eql(u8, parent_dir, b_dir)) {
+                        list[cnt] = .{
+                            .name = ".. (Parent Directory)",
+                            .full_path = arena.dupe(u8, parent_dir) catch parent_dir,
+                            .is_dir = true,
+                            .is_parent = true,
+                        };
+                        cnt += 1;
+                    }
+                }
             }
-        }
-    }
 
-    if (entry_count > 1) {
-        std.mem.sort(FilePickerEntry, entries[0..entry_count], {}, pickerEntryLessThan);
-    }
+            if (b_dir.len > 0 and b_dir.len < 500) {
+                var dir_z: [512:0]u8 = @splat(0);
+                @memcpy(dir_z[0..b_dir.len], b_dir);
+                dir_z[b_dir.len] = 0;
+                if (platform.fs_util.opendir(&dir_z)) |dirp| {
+                    defer _ = platform.fs_util.closedir(dirp);
+                    const show_hidden = (f_prefix.len > 0 and f_prefix[0] == '.');
+                    while (platform.fs_util.readdir(dirp)) |ent| {
+                        if (cnt >= list.len) break;
+                        const raw_ent_name = platform.fs_util.direntName(ent);
+                        if (raw_ent_name.len == 0 or std.mem.eql(u8, raw_ent_name, ".") or std.mem.eql(u8, raw_ent_name, "..")) continue;
+                        const name_raw = if (raw_ent_name.len > 8 and raw_ent_name[0] == '.' and std.mem.endsWith(u8, raw_ent_name, ".icloud")) blk: {
+                            const unwrapped = raw_ent_name[1 .. raw_ent_name.len - 7];
+                            break :blk if (unwrapped.len > 0 and unwrapped[0] != '.') unwrapped else raw_ent_name;
+                        } else raw_ent_name;
+                        if (!show_hidden and name_raw[0] == '.') continue;
+                        if (f_prefix.len > 0 and !root.containsIgnoreCase(name_raw, f_prefix)) continue;
+
+                        const joined = if (std.mem.eql(u8, b_dir, "/"))
+                            (std.fmt.allocPrint(arena, "/{s}", .{name_raw}) catch continue)
+                        else if (std.mem.eql(u8, b_dir, "."))
+                            (arena.dupe(u8, name_raw) catch continue)
+                        else
+                            (std.fmt.allocPrint(arena, "{s}/{s}", .{ b_dir, name_raw }) catch continue);
+
+                        var dup_entry = false;
+                        for (list[0..cnt]) |ex| {
+                            if (std.mem.eql(u8, ex.full_path, joined)) {
+                                dup_entry = true;
+                                break;
+                            }
+                        }
+                        if (dup_entry) continue;
+
+                        const is_dir = if (ent.d_type == platform.fs_util.DT_DIR)
+                            true
+                        else if (ent.d_type == platform.fs_util.DT_REG)
+                            false
+                        else
+                            checkPathIsDir(joined);
+                        if (!is_dir and !sctx.show_files) continue;
+
+                        const disp_name = if (is_dir)
+                            (std.fmt.allocPrint(arena, "{s}/", .{name_raw}) catch continue)
+                        else
+                            (arena.dupe(u8, name_raw) catch continue);
+
+                        list[cnt] = .{
+                            .name = disp_name,
+                            .full_path = joined,
+                            .is_dir = is_dir,
+                            .is_parent = false,
+                        };
+                        cnt += 1;
+                    }
+                }
+            }
+
+            if (cnt > 1) {
+                std.mem.sort(FilePickerEntry, list[0..cnt], {}, pickerEntryLessThan);
+            }
+
+            const res = arena.create(@This()) catch unreachable;
+            res.* = .{
+                .browse_dir = arena.dupe(u8, b_dir) catch b_dir,
+                .entries = list[0..cnt],
+            };
+            return res;
+        }
+    };
+
+    const scan_cache = uic.useFrameCache(
+        PickerScanCache,
+        id_scope,
+        PickerScanCache.ScanCtx{
+            .expanded = expanded,
+            .cwd_slice = cwd_slice,
+            .show_files = config.show_files,
+        },
+        PickerScanCache.build,
+    );
+    const browse_dir = scan_cache.browse_dir;
+    const entries = scan_cache.entries;
+    const entry_count = entries.len;
     if (entry_count > 0 and selected_idx.* >= entry_count) {
         selected_idx.* = entry_count - 1;
     }
@@ -472,7 +519,10 @@ pub fn filePickerModal(
         if (entry_count == 0) {
             uic.label("No matching folders or files in directory.", Color.rgb(100, 116, 139));
         } else {
-            for (entries[0..entry_count], 0..) |entry, e_idx| {
+            const vr = uic.computeVirtualRange(entry_count, 25.0, 2);
+            if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+            for (vr.first..vr.end) |e_idx| {
+                const entry = entries[e_idx];
                 var eid = uic.scopedId(e_idx + 5000);
                 defer eid.end();
 
@@ -490,6 +540,7 @@ pub fn filePickerModal(
                     clicked_entry_idx = e_idx;
                 }
             }
+            if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
         }
     }
 

@@ -689,4 +689,74 @@ test "Multiple Agent Buffers (*agent-N*): shared agy hub state, independent sess
     const sent_painted = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
     try std.testing.expect(sent_painted);
     try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+
+    // 8. Large Workspace Explorer Tree Virtualization & Watch Signature Stability:
+    //    - Register 300 nested files across 15 subdirectories and expand all folders
+    //    - Verify `state.cached_tree_nodes_list` caches all 300+ visible nodes in O(N)
+    //    - Verify viewport virtualization keeps `last_input_rect_count` strictly bounded (< 220 rects)
+    //      and preserves `last_input_rect_count == last_paint_rect_count` across scrolling and folder toggles
+    //    - Verify toggling folder expansion keeps `state.last_watch_sig == state.computeWorkspaceWatchSignature()`
+    state.has_opened_workspace = true;
+    for (0..15) |dir_i| {
+        for (0..20) |file_i| {
+            var path_buf: [128]u8 = undefined;
+            const rel_path = try std.fmt.bufPrint(&path_buf, "subsys/mod_{d:0>2}/driver_{d:0>2}.c", .{ dir_i, file_i });
+            state.registerDiscoveredWorkspaceFile(rel_path);
+        }
+    }
+    state.setAllFolderNodesExpanded(true);
+    try std.testing.expectEqual(state.last_watch_sig, state.computeWorkspaceWatchSignature());
+
+    state.doc.show_sidebar = true;
+    state.doc.active_sidebar_view = 0;
+    state.doc.sec_files = true;
+
+    _ = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, true, state, buildWorkbench);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+    try std.testing.expect(state.cached_tree_nodes_list.items.len >= 315);
+    // Even with 315+ expanded tree rows, virtualized Explorer only lays out visible rows + overscan
+    try std.testing.expect(state.ui_ctx.last_input_rect_count < 220);
+
+    // Scroll the Explorer sidebar down and verify two-phase layout rect count determinism holds
+    pctx.mouse_x = 120.0;
+    pctx.mouse_y = 300.0;
+    pctx.scroll_dy = -420.0;
+    const tree_scroll_painted = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
+    pctx.scroll_dy = 0.0;
+    try std.testing.expect(tree_scroll_painted);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+    try std.testing.expect(state.ui_ctx.last_input_rect_count < 220);
+
+    // Collapse a folder and verify watch signature stays synchronized without false-positive disk rescans
+    state.setFolderExpanded("subsys/mod_00", false);
+    try std.testing.expectEqual(state.last_watch_sig, state.computeWorkspaceWatchSignature());
+    const collapse_painted = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
+    try std.testing.expect(collapse_painted);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+
+    // 9. Explorer Outline Symbol Virtualization & Zero-Damage Idle Verification:
+    //    - Verify OUTLINE section handles switching between a buffer with many symbols and a Markdown buffer
+    //      with fewer headings without out-of-bounds slice panics or Pass.input/Pass.paint rect mismatch
+    //    - Verify an idle frame with Explorer + CodeEditor + Agent Panel open produces 0% damage (dirty_rect == null)
+    state.doc.sec_outline = true;
+    state.doc.show_agent_panel = true;
+    state.openFile(0);
+    state.openFile(1);
+    state.doc.panes[0].active_tab = 0;
+    _ = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, true, state, buildWorkbench);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+
+    // Switch active tab to Markdown buffer and verify two-phase determinism
+    state.doc.panes[0].active_tab = 1;
+    _ = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, true, state, buildWorkbench);
+    try std.testing.expectEqual(state.ui_ctx.last_input_rect_count, state.ui_ctx.last_paint_rect_count);
+
+    // Settle scroll heights across one normal frame, then verify the next idle frame skips Pass.paint (dirty_rect == null)
+    pctx.mouse_x = -1.0;
+    pctx.mouse_y = -1.0;
+    pctx.force_full_redraw = false;
+    _ = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
+    const idle_painted_2 = ui.runTwoPhaseFrame(&state.ui_ctx, &pctx, &state.frame_arena, false, state, buildWorkbench);
+    try std.testing.expect(!idle_painted_2);
+    try std.testing.expect(state.ui_ctx.dirty_rect == null);
 }

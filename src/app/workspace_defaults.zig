@@ -9,6 +9,7 @@ pub const BufferKind = enum {
     waveform_preview,
     pdf_preview,
     git_diff_preview,
+    app_preview,
     terminal,
     agent,
 
@@ -19,6 +20,7 @@ pub const BufferKind = enum {
             .waveform_preview,
             .pdf_preview,
             .git_diff_preview,
+            .app_preview,
             => true,
             .file, .terminal, .agent => false,
         };
@@ -31,6 +33,7 @@ pub const BufferKind = enum {
             .waveform_preview => "W",
             .pdf_preview => "PDF",
             .git_diff_preview => "D",
+            .app_preview => "APP",
             .terminal => "T",
             .agent => "✦",
         };
@@ -48,6 +51,7 @@ pub const SampleFile = struct {
     is_waveform_preview: bool = false,
     is_pdf_preview: bool = false,
     is_git_diff_preview: bool = false,
+    is_app_preview: bool = false,
     is_terminal: bool = false,
     terminal_slot: u16 = 0,
     is_agent: bool = false,
@@ -57,6 +61,7 @@ pub const SampleFile = struct {
     pub fn kind(self: SampleFile) BufferKind {
         if (self.is_agent) return .agent;
         if (self.is_terminal) return .terminal;
+        if (self.is_app_preview) return .app_preview;
         if (self.is_git_diff_preview) return .git_diff_preview;
         if (self.is_pdf_preview) return .pdf_preview;
         if (self.is_waveform_preview) return .waveform_preview;
@@ -130,6 +135,7 @@ pub const WORKSPACE_FILES = [_]SampleFile{
         \\
         \\| Shortcut | Command |
         \\| :--- | :--- |
+        \\| `Cmd + Shift + B` | Tasks: Run Build Task (`zig build`, `.vscode/tasks.json`, etc.) |
         \\| `Cmd + S` | Save active buffer to disk |
         \\| `Cmd + F` | Toggle Find in Buffer bar |
         \\| `Cmd + G` | Find Next match (`Cmd+Shift+G` Previous) |
@@ -266,6 +272,14 @@ pub const WORKSPACE_FILES = [_]SampleFile{
         .folder = "*special*",
         .language = .zig,
         .is_git_diff_preview = true,
+        .initial_source = "",
+    },
+    .{
+        .name = "*App Preview*",
+        .path = "*App Preview*",
+        .folder = "*special*",
+        .language = .zig,
+        .is_app_preview = true,
         .initial_source = "",
     },
 };

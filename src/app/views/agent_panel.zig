@@ -908,7 +908,7 @@ fn buildSession(
     if (uic.pass == .input) {
         const ss = uic.useState(ui.ScrollState, transcript_scroll_id, .{});
         const min_entries_h = @as(f32, @floatFromInt(entries.len)) * 36.0;
-        if (entries.len > 0 and ss.content_height < min_entries_h) {
+        if (entries.len > 0 and (ss.content_height == 0.0 or session.scroll_to_bottom_frames >= 2) and ss.content_height < min_entries_h) {
             ss.content_height = min_entries_h;
         }
         ss.viewport_height = @max(1.0, body_h - 24.0);

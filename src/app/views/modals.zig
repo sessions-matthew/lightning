@@ -6,8 +6,10 @@
 const std = @import("std");
 const skia = @import("skia");
 const ui = @import("ui");
+const platform = @import("platform");
 const state_mod = @import("../state.zig");
 const commands = @import("../commands.zig");
+const tasks_mod = @import("../tasks.zig");
 const EditorState = state_mod.EditorState;
 
 pub fn buildFindBar(state: *EditorState, file_idx_opt: ?usize) void {
@@ -145,6 +147,15 @@ const PaletteItemAction = union(enum) {
     jump_line: struct { file_idx: usize, line: usize, col: usize },
     run_command: PaletteCommandId,
     run_plugin_command: struct { plugin_idx: usize, cmd_idx: usize },
+    run_task: struct {
+        name: platform.InlineString(64),
+        command: platform.InlineString(256),
+        source: platform.InlineString(64),
+    },
+    select_preview_app: struct {
+        path: platform.InlineString(256),
+        name: platform.InlineString(64),
+    },
 };
 
 const PaletteEntry = struct {
@@ -198,6 +209,26 @@ fn executePaletteAction(state: *EditorState, action: PaletteItemAction) void {
         .run_plugin_command => |pc| {
             state.doc.show_command_palette = false;
             state.plugins.executePluginCommand(state, pc.plugin_idx, pc.cmd_idx);
+            uic.focused_id = state.activeEditorWidgetId();
+        },
+        .run_task => |rt| {
+            // Do not force the bottom panel open; run tasks quietly in their background execution context.
+            state.doc.bottom_panel_tab = 2; // Output Console tab
+            state.output_channel_filter.set("Tasks");
+            _ = state.task_runner.start(state, rt.name.slice(), rt.command.slice(), rt.source.slice());
+            state.doc.show_command_palette = false;
+            uic.focused_id = state.activeEditorWidgetId();
+        },
+        .select_preview_app => |app| {
+            state.app_custom_path.set(app.path.slice());
+            for (&state.app_views) |*v| {
+                v.setDylibPath(app.path.slice());
+            }
+            var notice_buf: [256]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, "Selected preview app: {s}", .{app.name.slice()}) catch "Selected preview app";
+            state.setStatusNotice(notice);
+            state.openAppPreviewBuffer(false);
+            state.doc.show_command_palette = false;
             uic.focused_id = state.activeEditorWidgetId();
         },
     }
@@ -307,7 +338,7 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
             if (entry_count < entries.len) {
                 entries[entry_count] = .{
                     .label = cmd.label,
-                    .meta = cmd.shortcut_display,
+                    .meta = state.shortcutDisplayForCommand(cmd.id, cmd.shortcut_display),
                     .icon_text = cmd.icon_text,
                     .icon_color = skia.Color.rgb(129, 140, 248),
                     .score = sc,
@@ -335,6 +366,139 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
                     };
                     entry_count += 1;
                 }
+            }
+        }
+
+        // Include workspace tasks declared in `.vscode/tasks.json`, `.vscode/launch.json`, or project manifests
+        var ws_tasks: [32]tasks_mod.TaskEntry = undefined;
+        const task_count = tasks_mod.listWorkspaceTasks(state, &ws_tasks);
+        for (ws_tasks[0..task_count]) |task| {
+            if (entry_count >= entries.len) break;
+            const t_name = task.nameSlice();
+            const t_cmd = task.commandSlice();
+            const t_label = uic.fmt("Tasks: Run Task — {s}", .{t_name});
+
+            var matched = false;
+            var sc: i32 = 0;
+
+            if (sub_q.len == 0) {
+                matched = true;
+                sc = 40;
+            } else if (std.mem.startsWith(u8, sub_q, "task:") or std.mem.startsWith(u8, sub_q, "tasks:")) {
+                const colon_pos = std.mem.indexOfScalar(u8, sub_q, ':').?;
+                const after_colon = std.mem.trim(u8, sub_q[colon_pos + 1 ..], " \t");
+                if (after_colon.len == 0) {
+                    matched = true;
+                    sc = 80;
+                } else if (ui.fuzzyScore(t_name, after_colon)) |s| {
+                    matched = true;
+                    sc = s + 50;
+                } else if (ui.fuzzyScore(t_cmd, after_colon)) |s| {
+                    matched = true;
+                    sc = s + 30;
+                }
+            } else if (ui.fuzzyScore(t_label, sub_q)) |s| {
+                matched = true;
+                sc = s;
+            } else if (ui.fuzzyScore(t_name, sub_q)) |s| {
+                matched = true;
+                sc = s + 25;
+            } else if (ui.fuzzyScore(t_cmd, sub_q)) |s| {
+                matched = true;
+                sc = s;
+            }
+
+            if (matched and entry_count < entries.len) {
+                entries[entry_count] = .{
+                    .label = t_label,
+                    .meta = t_cmd,
+                    .icon_text = "⚡",
+                    .icon_color = skia.Color.rgb(56, 189, 248),
+                    .score = sc,
+                    .action = .{ .run_task = .{
+                        .name = platform.InlineString(64).init(t_name),
+                        .command = platform.InlineString(256).init(t_cmd),
+                        .source = platform.InlineString(64).init(task.sourceSlice()),
+                    } },
+                };
+                entry_count += 1;
+            }
+        }
+    } else if (std.mem.startsWith(u8, q, "task:") or std.mem.startsWith(u8, q, "tasks:")) {
+        const colon_pos = std.mem.indexOfScalar(u8, q, ':').?;
+        const sub_q = std.mem.trim(u8, q[colon_pos + 1 ..], " \t");
+        var ws_tasks: [32]tasks_mod.TaskEntry = undefined;
+        const task_count = tasks_mod.listWorkspaceTasks(state, &ws_tasks);
+        for (ws_tasks[0..task_count]) |task| {
+            if (entry_count >= entries.len) break;
+            const t_name = task.nameSlice();
+            const t_cmd = task.commandSlice();
+            const t_label = uic.fmt("Tasks: Run Task — {s}", .{t_name});
+
+            var matched = false;
+            var sc: i32 = 80;
+            if (sub_q.len == 0) {
+                matched = true;
+            } else if (ui.fuzzyScore(t_name, sub_q)) |s| {
+                matched = true;
+                sc = s + 50;
+            } else if (ui.fuzzyScore(t_cmd, sub_q)) |s| {
+                matched = true;
+                sc = s + 20;
+            }
+
+            if (matched and entry_count < entries.len) {
+                entries[entry_count] = .{
+                    .label = t_label,
+                    .meta = t_cmd,
+                    .icon_text = "⚡",
+                    .icon_color = skia.Color.rgb(56, 189, 248),
+                    .score = sc,
+                    .action = .{ .run_task = .{
+                        .name = platform.InlineString(64).init(t_name),
+                        .command = platform.InlineString(256).init(t_cmd),
+                        .source = platform.InlineString(64).init(task.sourceSlice()),
+                    } },
+                };
+                entry_count += 1;
+            }
+        }
+    } else if (std.mem.startsWith(u8, q, "app:") or std.mem.startsWith(u8, q, "preview app:")) {
+        const colon_pos = std.mem.indexOfScalar(u8, q, ':').?;
+        const sub_q = std.mem.trim(u8, q[colon_pos + 1 ..], " \t");
+        var app_dylibs: [32]tasks_mod.AppDylibEntry = undefined;
+        const dylib_count = tasks_mod.listWorkspaceAppDylibs(state, &app_dylibs);
+        for (app_dylibs[0..dylib_count]) |cand| {
+            if (entry_count >= entries.len) break;
+            const c_name = cand.nameSlice();
+            const c_path = cand.pathSlice();
+            const c_label = uic.fmt("App Preview: {s}", .{c_name});
+
+            var matched = false;
+            var sc: i32 = 80;
+            if (sub_q.len == 0) {
+                matched = true;
+            } else if (ui.fuzzyScore(c_name, sub_q)) |s| {
+                matched = true;
+                sc = s + 50;
+            } else if (ui.fuzzyScore(c_path, sub_q)) |s| {
+                matched = true;
+                sc = s + 20;
+            }
+
+            if (matched and entry_count < entries.len) {
+                entries[entry_count] = .{
+                    .label = c_label,
+                    .meta = c_path,
+                    .icon_text = "📱",
+                    .icon_color = skia.Color.rgb(168, 85, 247),
+                    .score = sc,
+                    .action = .{ .select_preview_app = .{
+                        .path = platform.InlineString(256).init(c_path),
+                        .name = platform.InlineString(64).init(c_name),
+                    } },
+                };
+                entry_count += 1;
             }
         }
     } else if (std.mem.startsWith(u8, q, "@")) {
@@ -483,11 +647,13 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
                     state.markdownPreviewSourceName(idx)
                 else
                     file.path,
-                .icon_text = if (file.is_agent) "✦" else if (file.is_terminal) "T" else if (file.is_waveform_preview) "W" else if (file.is_markdown_preview) "P" else if (is_md) "M" else "Z",
+                .icon_text = if (file.is_agent) "✦" else if (file.is_terminal) "T" else if (file.is_app_preview) "⚡" else if (file.is_waveform_preview) "W" else if (file.is_markdown_preview) "P" else if (is_md) "M" else "Z",
                 .icon_color = if (file.is_agent)
                     skia.Color.rgb(88, 166, 255)
                 else if (file.is_terminal)
                     skia.Color.rgb(52, 211, 153)
+                else if (file.is_app_preview)
+                    skia.Color.rgb(245, 158, 11)
                 else if (file.is_waveform_preview)
                     skia.Color.rgb(168, 85, 247)
                 else if (is_md)
@@ -519,7 +685,7 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
                 if (entry_count >= entries.len or added_cmds >= 6) break;
                 entries[entry_count] = .{
                     .label = cmd.label,
-                    .meta = cmd.shortcut_display,
+                    .meta = state.shortcutDisplayForCommand(cmd.id, cmd.shortcut_display),
                     .icon_text = cmd.icon_text,
                     .icon_color = skia.Color.rgb(129, 140, 248),
                     .score = -10,
@@ -542,6 +708,7 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
     }
 
     // 5. Scrollable Results List
+    var clicked_action: ?PaletteItemAction = null;
     {
         var list_scroll = uic.scrollPanel("palette_results_scroll", .{
             .h = .pixels(184),
@@ -554,7 +721,9 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
         if (entry_count == 0) {
             uic.label("No matching files, commands, or symbols.", null);
         } else {
-            for (entries[0..entry_count], 0..) |entry, e_idx| {
+            const vr = uic.computeVirtualRange(entry_count, 26.0, 2);
+            if (vr.top_spacer_h > 0) uic.spacer(vr.top_spacer_h);
+            for (entries[vr.first..vr.end], vr.first..) |entry, e_idx| {
                 var eid = uic.scopedId(e_idx + 2000);
                 defer eid.end();
 
@@ -569,12 +738,17 @@ pub fn buildCommandPaletteOverlay(state: *EditorState, overlay_rect: skia.c.sk_r
                     .mono_label = entry.mono,
                 })) {
                     state.palette_selected_idx = e_idx;
-                    executePaletteAction(state, entry.action);
-                    uic.invalidateWindow();
-                    return;
+                    clicked_action = entry.action;
                 }
             }
+            if (vr.bottom_spacer_h > 0) uic.spacer(vr.bottom_spacer_h);
         }
+    }
+
+    if (clicked_action) |act| {
+        executePaletteAction(state, act);
+        uic.invalidateWindow();
+        return;
     }
 
     if (tf.submitted) {

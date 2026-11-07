@@ -160,6 +160,9 @@ pub fn build(
         if (file.is_waveform_preview) {
             break :blk uic.fmt("{s} · *Waveform Preview* — {s}", .{ ws_name, wfs[state.waveformPreviewSourceIndex()].path });
         }
+        if (file.is_app_preview) {
+            break :blk uic.fmt("{s} · *App Simulator*", .{ws_name});
+        }
         break :blk if (state.isFileDirty(f_idx))
             uic.fmt("{s} — {s} ●", .{ ws_name, file.path })
         else

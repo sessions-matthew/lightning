@@ -68,6 +68,14 @@ fn resolveDylibAbsolutePath(arena: std.mem.Allocator, raw_dylib: []const u8) ![:
     return expanded;
 }
 
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    return true;
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -84,7 +92,33 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--frames") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--attach")) {
+            var target_opt: ?[]const u8 = null;
+            var cmd_start: usize = i + 1;
+            if (cmd_start < args.len) {
+                const first = args[cmd_start];
+                if (std.mem.eql(u8, first, "list") or
+                    isAllDigits(first) or
+                    std.mem.startsWith(u8, first, "/") or
+                    std.mem.endsWith(u8, first, ".sock"))
+                {
+                    target_opt = first;
+                    cmd_start += 1;
+                } else if (std.mem.eql(u8, first, "auto")) {
+                    target_opt = null;
+                    cmd_start += 1;
+                }
+            }
+            var cmd_buf: std.ArrayList(u8) = .empty;
+            defer cmd_buf.deinit(arena);
+            for (args[cmd_start..], 0..) |tok, tidx| {
+                if (tidx > 0) try cmd_buf.append(arena, ' ');
+                try cmd_buf.appendSlice(arena, tok);
+            }
+            const cmd_slice = if (cmd_buf.items.len > 0) cmd_buf.items else "status";
+            try platform.profiler.runAttachCli(arena, target_opt, cmd_slice);
+            return;
+        } else if (std.mem.eql(u8, args[i], "--frames") and i + 1 < args.len) {
             max_frames = try std.fmt.parseInt(usize, args[i + 1], 10);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--screenshot") and i + 1 < args.len) {
@@ -123,6 +157,9 @@ pub fn main(init: std.process.Init) !void {
                 \\  --metrics-json <path>   Export machine-readable frame performance metrics to JSON file
                 \\  --trace <path>          Export Chrome/Perfetto JSON trace event file (view in ui.perfetto.dev)
                 \\  --scenario <name>       Run scripted synthetic input scenario: typing | scroll | idle
+                \\  --attach [pid] [cmd]    Connect to a running editor instance to debug live performance:
+                \\                            status | metrics | frames [N] | trace start | trace stop [path] |
+                \\                            overlay [on|off|toggle] | redraw | reset | list | help
                 \\  -h, --help              Show this help message
                 \\
             , .{fs_util.DefaultAppLibPath});

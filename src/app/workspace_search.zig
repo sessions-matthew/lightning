@@ -10,6 +10,10 @@ const state_mod = @import("state.zig");
 const EditorState = state_mod.EditorState;
 const isPdfCandidatePath = workspace_fs.isPdfCandidatePath;
 const isImageCandidatePath = workspace_fs.isImageCandidatePath;
+const isAudioCandidatePath = workspace_fs.isAudioCandidatePath;
+const isVideoCandidatePath = workspace_fs.isVideoCandidatePath;
+const isBinaryExtension = workspace_fs.isBinaryExtension;
+const isBinaryFileOnDisk = workspace_fs.isBinaryFileOnDisk;
 const isDatalessFileOnDisk = workspace_fs.isDatalessFileOnDisk;
 
 pub const MaxWorkspaceSearchMatches: usize = 32;
@@ -134,10 +138,10 @@ pub fn workspaceSearchMatches(self: *EditorState) []const WorkspaceSearchMatch {
         if (match_count >= MaxWorkspaceSearchMatches) break;
         for (wfs, 0..) |file, f_idx| {
             if (match_count >= MaxWorkspaceSearchMatches) break;
-            if (file.isSpecial() or isPdfCandidatePath(file.path) or isImageCandidatePath(file.path)) continue;
+            if (file.isSpecial() or isPdfCandidatePath(file.path) or isImageCandidatePath(file.path) or isAudioCandidatePath(file.path) or isVideoCandidatePath(file.path) or isBinaryExtension(file.path)) continue;
             const is_docs_file = std.mem.startsWith(u8, file.path, "docs/");
             if ((search_pass == 0 and is_docs_file) or (search_pass == 1 and !is_docs_file)) continue;
-            if (!self.loaded_from_disk[f_idx] and isDatalessFileOnDisk(file.path.ptr)) continue;
+            if (!self.loaded_from_disk[f_idx] and (isDatalessFileOnDisk(file.path.ptr) or isBinaryFileOnDisk(file.path))) continue;
 
             self.ensureFileLoaded(f_idx);
             const text = self.buffers[f_idx].slice();
@@ -204,7 +208,7 @@ pub fn replaceInWorkspace(self: *EditorState, query: []const u8, replacement: []
     var replaced_count: usize = 0;
     const wfs = self.workspaceFiles();
     for (wfs, 0..) |file, f_idx| {
-        if (file.isSpecial() or isPdfCandidatePath(file.path) or isImageCandidatePath(file.path)) continue;
+        if (file.isSpecial() or isPdfCandidatePath(file.path) or isImageCandidatePath(file.path) or isAudioCandidatePath(file.path) or isVideoCandidatePath(file.path) or isBinaryExtension(file.path)) continue;
         if (!self.loaded_from_disk[f_idx]) continue;
         const buf = &self.buffers[f_idx];
         var pos: usize = 0;

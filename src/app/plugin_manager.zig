@@ -1222,11 +1222,7 @@ fn hostSyncWorkspaceGit(host_opaque: *anyopaque, save_dirty: bool, reload_from_d
         _ = hctx.state.saveAllDirtyFiles();
     }
     if (reload_from_disk) {
-        for (0..hctx.state.file_count) |idx| {
-            if (!hctx.state.files[idx].isSpecial()) {
-                hctx.state.loadFileFromDiskOrFallback(idx);
-            }
-        }
+        _ = hctx.state.reloadModifiedOpenFiles();
     }
     hctx.state.refreshGitStatus();
     hctx.state.refreshActiveGitDiffContent();
@@ -1240,7 +1236,7 @@ fn hostGetGitStatus(host_opaque: *anyopaque, out: *abi.GitStatusSnapshotV1) call
 
     const wfs = state.workspaceFiles();
     var entry_count: usize = 0;
-    for (wfs, 0..) |wf, idx| {
+    for (wfs, 0..) |*wf, idx| {
         if (wf.isSpecial()) continue;
         if (idx < state.git_file_statuses.len) {
             const fs = state.git_file_statuses[idx];
@@ -1253,7 +1249,7 @@ fn hostGetGitStatus(host_opaque: *anyopaque, out: *abi.GitStatusSnapshotV1) call
     if (entry_count > 0) {
         files_slice = allocator.alloc(abi.GitFileStatusV1, entry_count) catch return false;
         var out_idx: usize = 0;
-        for (wfs, 0..) |wf, idx| {
+        for (wfs, 0..) |*wf, idx| {
             if (wf.isSpecial()) continue;
             if (idx < state.git_file_statuses.len) {
                 const fs = state.git_file_statuses[idx];

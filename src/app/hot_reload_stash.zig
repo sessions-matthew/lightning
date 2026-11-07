@@ -37,6 +37,7 @@ pub const HotReloadSpecialKind = enum(u8) {
     waveform_preview,
     pdf_preview,
     git_diff_preview,
+    app_preview,
 };
 
 pub const HotReloadSpecialEntry = struct {
@@ -90,11 +91,17 @@ pub const HotReloadStashMeta = struct {
     pdf_custom_bytes: platform.InlineString(4096) = .{},
     pdf_views: [MaxEditorPanes]ui.PdfViewState = @splat(.{}),
     image_views: [MaxEditorPanes]ui.ImageViewState = @splat(.{}),
+    audio_views: [MaxEditorPanes]ui.AudioPlayerState = @splat(.{}),
+    video_views: [MaxEditorPanes]ui.VideoPlayerState = @splat(.{}),
     git_diff_custom_text: platform.InlineString(16384) = .{},
     git_diff_custom_path: platform.InlineString(128) = .{},
     git_diff_title: platform.InlineString(128) = .{},
     git_diff_commit: platform.InlineString(16) = .{},
     git_diff_views: [MaxEditorPanes]ui.DiffViewState = @splat(.{}),
+    app_custom_path: platform.InlineString(256) = .{},
+    app_presets: [MaxEditorPanes]ui.DevicePreset = @splat(.ipad_air_11),
+    app_orientations: [MaxEditorPanes]ui.Orientation = @splat(.portrait),
+    app_zoom_fits: [MaxEditorPanes]bool = @splat(true),
 
     focused_id: ui.WidgetId = 0,
 };
@@ -159,6 +166,7 @@ pub fn restoreSpecialBufferSlot(self: *EditorState, sp: HotReloadSpecialEntry) ?
             .waveform_preview => self.files[existing_idx].is_waveform_preview = true,
             .pdf_preview => self.files[existing_idx].is_pdf_preview = true,
             .git_diff_preview => self.files[existing_idx].is_git_diff_preview = true,
+            .app_preview => self.files[existing_idx].is_app_preview = true,
             .none => {},
         }
         return existing_idx;
@@ -211,6 +219,10 @@ pub fn restoreSpecialBufferSlot(self: *EditorState, sp: HotReloadSpecialEntry) ?
         .git_diff_preview => {
             self.files[idx].is_git_diff_preview = true;
             self.files[idx].name = "*Git Diff*";
+        },
+        .app_preview => {
+            self.files[idx].is_app_preview = true;
+            self.files[idx].name = "*App Preview*";
         },
         .none => {},
     }
@@ -332,6 +344,8 @@ pub fn onBeforeReload(self: *EditorState, ctx: *PlatformContext) void {
             kind = .pdf_preview;
         } else if (wf.is_git_diff_preview) {
             kind = .git_diff_preview;
+        } else if (wf.is_app_preview) {
+            kind = .app_preview;
         }
         if (kind == .none) continue;
 
@@ -406,11 +420,24 @@ pub fn onBeforeReload(self: *EditorState, ctx: *PlatformContext) void {
     meta.pdf_custom_bytes = self.pdf_custom_bytes;
     meta.pdf_views = self.pdf_views;
     meta.image_views = self.image_views;
+    meta.audio_views = self.audio_views;
+    // Clear ObjC generator handles before copying so the stash snapshot never
+    // holds raw ARC-managed pointers that may be freed during dlclose/dlopen.
+    for (0..MaxEditorPanes) |vp| {
+        self.video_views[vp].clearNativeHandles();
+    }
+    meta.video_views = self.video_views;
     meta.git_diff_custom_text = self.git_diff_custom_text;
     meta.git_diff_custom_path = self.git_diff_custom_path;
     meta.git_diff_title = self.git_diff_title;
     meta.git_diff_commit = self.git_diff_commit;
     meta.git_diff_views = self.git_diff_views;
+    meta.app_custom_path = self.app_custom_path;
+    for (0..MaxEditorPanes) |p| {
+        meta.app_presets[p] = self.app_views[p].preset;
+        meta.app_orientations[p] = self.app_views[p].orientation;
+        meta.app_zoom_fits[p] = self.app_views[p].zoom_fit;
+    }
     meta.focused_id = self.ui_ctx.focused_id;
     meta.scratch_word_wrap = self.scratch_word_wrap;
 
@@ -680,11 +707,27 @@ pub fn onAfterReload(self: *EditorState) void {
         self.pdf_custom_bytes = meta.pdf_custom_bytes;
         self.pdf_views = meta.pdf_views;
         self.image_views = meta.image_views;
+        self.audio_views = meta.audio_views;
+        // Defensively clear ObjC handles on the restored copy so the new
+        // dylib never dereferences a pointer from the unloaded old image.
+        self.video_views = meta.video_views;
+        for (0..MaxEditorPanes) |vp| {
+            self.video_views[vp].clearNativeHandles();
+        }
         self.git_diff_custom_text = meta.git_diff_custom_text;
         self.git_diff_custom_path = meta.git_diff_custom_path;
         self.git_diff_title = meta.git_diff_title;
         self.git_diff_commit = meta.git_diff_commit;
         self.git_diff_views = meta.git_diff_views;
+        self.app_custom_path = meta.app_custom_path;
+        for (0..MaxEditorPanes) |p| {
+            self.app_views[p].preset = meta.app_presets[p];
+            self.app_views[p].orientation = meta.app_orientations[p];
+            self.app_views[p].zoom_fit = meta.app_zoom_fits[p];
+            if (self.app_custom_path.slice().len > 0) {
+                self.app_views[p].setDylibPath(self.app_custom_path.slice());
+            }
+        }
         self.scratch_word_wrap = meta.scratch_word_wrap;
         if (meta.focused_id != 0) {
             self.ui_ctx.focused_id = meta.focused_id;

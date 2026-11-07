@@ -55,6 +55,121 @@ pub const Shortcut = struct {
         pos = appendSliceBounded(buf, pos, keyCodeDisplayName(self.key));
         return buf[0..pos];
     }
+
+    /// Parses a single shortcut specification string (e.g. `"cmd+shift+b"`, `"shift+cmd+p"`, `"ctrl+alt+s"`, `"f5"`, `"alt+z"`).
+    /// Returns `null` if the string cannot be parsed into a valid key and modifiers.
+    pub fn parse(str: []const u8) ?Shortcut {
+        const trimmed = std.mem.trim(u8, str, " \t\r\n");
+        if (trimmed.len == 0) return null;
+
+        var cmd = false;
+        var ctrl = false;
+        var alt = false;
+        var shift = false;
+        var cmd_or_ctrl = false;
+        var key_opt: ?KeyCode = null;
+
+        var it = std.mem.tokenizeScalar(u8, trimmed, '+');
+        while (it.next()) |token| {
+            const tok = std.mem.trim(u8, token, " \t\r\n");
+            if (tok.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(tok, "cmd") or std.ascii.eqlIgnoreCase(tok, "command") or
+                std.ascii.eqlIgnoreCase(tok, "meta") or std.ascii.eqlIgnoreCase(tok, "super") or
+                std.ascii.eqlIgnoreCase(tok, "win"))
+            {
+                cmd = true;
+            } else if (std.ascii.eqlIgnoreCase(tok, "ctrl") or std.ascii.eqlIgnoreCase(tok, "control")) {
+                ctrl = true;
+            } else if (std.ascii.eqlIgnoreCase(tok, "shift")) {
+                shift = true;
+            } else if (std.ascii.eqlIgnoreCase(tok, "alt") or std.ascii.eqlIgnoreCase(tok, "opt") or
+                std.ascii.eqlIgnoreCase(tok, "option"))
+            {
+                alt = true;
+            } else if (std.ascii.eqlIgnoreCase(tok, "cmdorctrl") or std.ascii.eqlIgnoreCase(tok, "ctrlcmd") or
+                std.ascii.eqlIgnoreCase(tok, "primary"))
+            {
+                cmd_or_ctrl = true;
+            } else {
+                if (key_opt != null) return null;
+                key_opt = parseKeyCode(tok);
+                if (key_opt == null) return null;
+            }
+        }
+
+        const key = key_opt orelse return null;
+        return Shortcut{
+            .key = key,
+            .cmd = cmd,
+            .ctrl = ctrl,
+            .alt = alt,
+            .shift = shift,
+            .cmd_or_ctrl = cmd_or_ctrl,
+        };
+    }
+};
+
+/// A single shortcut or a two-step keyboard chord sequence (e.g. `"cmd+k cmd+s"`),
+/// matching the standard VS Code keybinding chord specification.
+pub const KeyChord = struct {
+    first: Shortcut,
+    second: ?Shortcut = null,
+
+    pub fn init(first: Shortcut, second: ?Shortcut) KeyChord {
+        return .{ .first = first, .second = second };
+    }
+
+    pub fn single(sc: Shortcut) KeyChord {
+        return .{ .first = sc, .second = null };
+    }
+
+    /// Parses a VS Code-style keybinding string, supporting single shortcuts (e.g. `"shift+cmd+b"`)
+    /// or space-separated chords (e.g. `"cmd+k cmd+s"`).
+    pub fn parse(str: []const u8) ?KeyChord {
+        const trimmed = std.mem.trim(u8, str, " \t\r\n");
+        if (trimmed.len == 0) return null;
+
+        var it = std.mem.tokenizeScalar(u8, trimmed, ' ');
+        const first_str = it.next() orelse return null;
+        const first_sc = Shortcut.parse(first_str) orelse return null;
+
+        if (it.next()) |second_str| {
+            const second_sc = Shortcut.parse(second_str) orelse return null;
+            return KeyChord{ .first = first_sc, .second = second_sc };
+        }
+
+        return KeyChord{ .first = first_sc, .second = null };
+    }
+
+    pub fn isChord(self: KeyChord) bool {
+        return self.second != null;
+    }
+
+    pub fn matchesFirst(self: KeyChord, ev: KeyEvent) bool {
+        return self.first.matches(ev);
+    }
+
+    pub fn matchesSecond(self: KeyChord, ev: KeyEvent) bool {
+        if (self.second) |sc2| {
+            return sc2.matches(ev);
+        }
+        return false;
+    }
+
+    /// Formats the key chord into human-readable text (e.g. `"Shift+Cmd+B"` or `"Cmd+K Cmd+S"`).
+    pub fn format(self: KeyChord, buf: []u8) []const u8 {
+        var first_buf: [32]u8 = undefined;
+        const first_str = self.first.format(&first_buf);
+        if (self.second) |sc2| {
+            var second_buf: [32]u8 = undefined;
+            const second_str = sc2.format(&second_buf);
+            return std.fmt.bufPrint(buf, "{s} {s}", .{ first_str, second_str }) catch first_str;
+        } else {
+            const copy_len = @min(buf.len, first_str.len);
+            @memcpy(buf[0..copy_len], first_str[0..copy_len]);
+            return buf[0..copy_len];
+        }
+    }
 };
 
 fn appendSliceBounded(buf: []u8, pos: usize, text: []const u8) usize {
@@ -108,20 +223,126 @@ pub fn keyCodeDisplayName(key: KeyCode) []const u8 {
         .key_x => "X",
         .key_y => "Y",
         .key_z => "Z",
+        .key_0 => "0",
         .key_1 => "1",
         .key_2 => "2",
+        .key_3 => "3",
+        .key_4 => "4",
+        .key_5 => "5",
         .key_6 => "6",
+        .key_7 => "7",
+        .key_8 => "8",
+        .key_9 => "9",
         .key_backslash => "\\",
         .key_slash => "/",
         .key_lbracket => "[",
         .key_rbracket => "]",
         .key_minus => "-",
         .key_space => "Space",
+        .f1 => "F1",
+        .f2 => "F2",
+        .f3 => "F3",
+        .f4 => "F4",
         .f5 => "F5",
+        .f6 => "F6",
+        .f7 => "F7",
+        .f8 => "F8",
         .f9 => "F9",
         .f10 => "F10",
         .f11 => "F11",
+        .f12 => "F12",
     };
+}
+
+/// Parses a string representation of a key into a `KeyCode`.
+/// Supports letters (`"a"`..`"z"`), digits (`"0"`..`"9"`), function keys (`"f1"`..`"f12"`),
+/// special keys (`"enter"`, `"escape"`, `"tab"`, `"space"`, `"backspace"`, `"delete"`),
+/// arrow keys, and punctuation.
+pub fn parseKeyCode(name: []const u8) ?KeyCode {
+    const s = std.mem.trim(u8, name, " \t\r\n");
+    if (s.len == 0) return null;
+    if (s.len == 1) {
+        const ch = std.ascii.toLower(s[0]);
+        return switch (ch) {
+            'a' => .key_a,
+            'b' => .key_b,
+            'c' => .key_c,
+            'd' => .key_d,
+            'e' => .key_e,
+            'f' => .key_f,
+            'g' => .key_g,
+            'h' => .key_h,
+            'i' => .key_i,
+            'j' => .key_j,
+            'k' => .key_k,
+            'l' => .key_l,
+            'm' => .key_m,
+            'n' => .key_n,
+            'o' => .key_o,
+            'p' => .key_p,
+            'q' => .key_q,
+            'r' => .key_r,
+            's' => .key_s,
+            't' => .key_t,
+            'u' => .key_u,
+            'v' => .key_v,
+            'w' => .key_w,
+            'x' => .key_x,
+            'y' => .key_y,
+            'z' => .key_z,
+            '0' => .key_0,
+            '1' => .key_1,
+            '2' => .key_2,
+            '3' => .key_3,
+            '4' => .key_4,
+            '5' => .key_5,
+            '6' => .key_6,
+            '7' => .key_7,
+            '8' => .key_8,
+            '9' => .key_9,
+            '\\' => .key_backslash,
+            '/' => .key_slash,
+            '[' => .key_lbracket,
+            ']' => .key_rbracket,
+            '-' => .key_minus,
+            ' ' => .key_space,
+            else => null,
+        };
+    }
+
+    if (std.ascii.eqlIgnoreCase(s, "enter") or std.ascii.eqlIgnoreCase(s, "return")) return .enter;
+    if (std.ascii.eqlIgnoreCase(s, "escape") or std.ascii.eqlIgnoreCase(s, "esc")) return .escape;
+    if (std.ascii.eqlIgnoreCase(s, "tab")) return .tab;
+    if (std.ascii.eqlIgnoreCase(s, "space") or std.ascii.eqlIgnoreCase(s, "spacebar")) return .key_space;
+    if (std.ascii.eqlIgnoreCase(s, "backspace") or std.ascii.eqlIgnoreCase(s, "bksp")) return .backspace;
+    if (std.ascii.eqlIgnoreCase(s, "delete") or std.ascii.eqlIgnoreCase(s, "del")) return .delete_forward;
+    if (std.ascii.eqlIgnoreCase(s, "left")) return .left;
+    if (std.ascii.eqlIgnoreCase(s, "right")) return .right;
+    if (std.ascii.eqlIgnoreCase(s, "up")) return .up;
+    if (std.ascii.eqlIgnoreCase(s, "down")) return .down;
+    if (std.ascii.eqlIgnoreCase(s, "home")) return .home;
+    if (std.ascii.eqlIgnoreCase(s, "end")) return .end;
+    if (std.ascii.eqlIgnoreCase(s, "pageup") or std.ascii.eqlIgnoreCase(s, "page_up")) return .page_up;
+    if (std.ascii.eqlIgnoreCase(s, "pagedown") or std.ascii.eqlIgnoreCase(s, "page_down")) return .page_down;
+    if (std.ascii.eqlIgnoreCase(s, "backslash")) return .key_backslash;
+    if (std.ascii.eqlIgnoreCase(s, "slash")) return .key_slash;
+    if (std.ascii.eqlIgnoreCase(s, "lbracket") or std.ascii.eqlIgnoreCase(s, "bracketleft")) return .key_lbracket;
+    if (std.ascii.eqlIgnoreCase(s, "rbracket") or std.ascii.eqlIgnoreCase(s, "bracketright")) return .key_rbracket;
+    if (std.ascii.eqlIgnoreCase(s, "minus")) return .key_minus;
+    if (std.ascii.eqlIgnoreCase(s, "f1")) return .f1;
+    if (std.ascii.eqlIgnoreCase(s, "f2")) return .f2;
+    if (std.ascii.eqlIgnoreCase(s, "f3")) return .f3;
+    if (std.ascii.eqlIgnoreCase(s, "f4")) return .f4;
+    if (std.ascii.eqlIgnoreCase(s, "f5")) return .f5;
+    if (std.ascii.eqlIgnoreCase(s, "f6")) return .f6;
+    if (std.ascii.eqlIgnoreCase(s, "f7")) return .f7;
+    if (std.ascii.eqlIgnoreCase(s, "f8")) return .f8;
+    if (std.ascii.eqlIgnoreCase(s, "f9")) return .f9;
+    if (std.ascii.eqlIgnoreCase(s, "f10")) return .f10;
+    if (std.ascii.eqlIgnoreCase(s, "f11")) return .f11;
+    if (std.ascii.eqlIgnoreCase(s, "f12")) return .f12;
+
+    return null;
 }
 
 /// Generic comptime command specification struct for building application command registries and palettes.
@@ -419,4 +640,53 @@ test "matchesCommandQuery and scoreCommandMatch ranking" {
     try std.testing.expect(prefix_score > word_boundary_score);
     try std.testing.expect(word_boundary_score > subsequence_score);
     try std.testing.expect(subsequence_score > category_only_score);
+}
+
+test "Shortcut.parse and KeyChord.parse for VS Code keybindings" {
+    // 1. Single shortcut parsing
+    const sc_build = Shortcut.parse("command+shift+b").?;
+    try std.testing.expectEqual(KeyCode.key_b, sc_build.key);
+    try std.testing.expect(sc_build.cmd);
+    try std.testing.expect(sc_build.shift);
+    try std.testing.expect(!sc_build.alt);
+    try std.testing.expect(!sc_build.ctrl);
+
+    const sc_build2 = Shortcut.parse("shift+cmd+b").?;
+    try std.testing.expectEqual(KeyCode.key_b, sc_build2.key);
+    try std.testing.expect(sc_build2.cmd);
+    try std.testing.expect(sc_build2.shift);
+
+    const sc_ctrl_b = Shortcut.parse("ctrl+shift+b").?;
+    try std.testing.expectEqual(KeyCode.key_b, sc_ctrl_b.key);
+    try std.testing.expect(sc_ctrl_b.ctrl);
+    try std.testing.expect(sc_ctrl_b.shift);
+    try std.testing.expect(!sc_ctrl_b.cmd);
+
+    const sc_f5 = Shortcut.parse("F5").?;
+    try std.testing.expectEqual(KeyCode.f5, sc_f5.key);
+    try std.testing.expect(!sc_f5.cmd);
+
+    const sc_alt_z = Shortcut.parse("alt+z").?;
+    try std.testing.expectEqual(KeyCode.key_z, sc_alt_z.key);
+    try std.testing.expect(sc_alt_z.alt);
+
+    // 2. Chords
+    const chord_single = KeyChord.parse("cmd+shift+b").?;
+    try std.testing.expect(!chord_single.isChord());
+    var fmt_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Shift+Cmd+B", chord_single.format(&fmt_buf));
+
+    const chord_seq = KeyChord.parse("cmd+k cmd+s").?;
+    try std.testing.expect(chord_seq.isChord());
+    try std.testing.expectEqual(KeyCode.key_k, chord_seq.first.key);
+    try std.testing.expect(chord_seq.first.cmd);
+    try std.testing.expectEqual(KeyCode.key_s, chord_seq.second.?.key);
+    try std.testing.expect(chord_seq.second.?.cmd);
+    try std.testing.expectEqualStrings("Cmd+K Cmd+S", chord_seq.format(&fmt_buf));
+
+    // 3. parseKeyCode
+    try std.testing.expectEqual(KeyCode.enter, parseKeyCode("enter").?);
+    try std.testing.expectEqual(KeyCode.escape, parseKeyCode("esc").?);
+    try std.testing.expectEqual(KeyCode.tab, parseKeyCode("tab").?);
+    try std.testing.expectEqual(KeyCode.key_backslash, parseKeyCode("\\").?);
 }

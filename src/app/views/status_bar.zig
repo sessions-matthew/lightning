@@ -41,7 +41,13 @@ pub fn build(state: *EditorState, ctx: *const PlatformContext) void {
         const active_buf = &state.buffers[idx];
         const sel = active_buf.selectionRange();
         const sel_len = sel.end - sel.start;
-        const right_status = if (sel_len > 0)
+        const right_status = if (EditorState.isAudioCandidatePath(file.path))
+            uic.fmt("Audio Player    {s}", .{file.name})
+        else if (EditorState.isVideoCandidatePath(file.path))
+            uic.fmt("Video Player    {s}", .{file.name})
+        else if (EditorState.isImageCandidatePath(file.path))
+            uic.fmt("Image Viewer    {s}", .{file.name})
+        else if (sel_len > 0)
             uic.fmt("Ln {d}, Col {d} ({d} selected)    UTF-8    {s}", .{
                 state.doc.cursor_line,
                 state.doc.cursor_col,
