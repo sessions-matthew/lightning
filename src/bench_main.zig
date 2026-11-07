@@ -678,5 +678,121 @@ pub fn main() !void {
         );
     }
 
+    // ------------------------------------------------------------------------
+    // 10. Video Player Two-Phase Latency & Playback Throughput Benchmark
+    // ------------------------------------------------------------------------
+    {
+        var uic = ui.Context{
+            .arena = arena.allocator(),
+            .canvas = canvas,
+            .paint = paint,
+            .font_title = font,
+            .font_body = font,
+            .font_mono = font,
+        };
+        defer uic.deinit();
+
+        const win_rect = skia.Rect.xywh(0, 0, 1280, 720);
+        var vid_st = ui.VideoPlayerState{};
+        defer vid_st.deinit();
+        vid_st.play("assets/test_video.mp4");
+
+        const num_frames: u64 = 60;
+        const t0 = platform.profiler.nowNs();
+        for (0..num_frames) |_| {
+            _ = arena.reset(.retain_capacity);
+            uic.beginPass(.input, arena.allocator(), canvas, win_rect, 0, 0, false, false, false);
+            _ = uic.videoPlayer("bench_vid", 1280, 720, &vid_st, .{
+                .file_path = "assets/test_video.mp4",
+                .raw_bytes = "",
+            });
+            uic.endPass();
+
+            uic.beginPass(.paint, arena.allocator(), canvas, win_rect, 0, 0, false, false, false);
+            _ = uic.videoPlayer("bench_vid", 1280, 720, &vid_st, .{
+                .file_path = "assets/test_video.mp4",
+                .raw_bytes = "",
+            });
+            uic.endPass();
+        }
+        const dt_ns = platform.profiler.nowNs() - t0;
+        const avg_us = (dt_ns / num_frames) / 1000;
+        const max_fps = if (avg_us > 0) 1_000_000 / avg_us else 0;
+
+        std.debug.print(
+            "[10. VideoPlayer]   test_video.mp4 (320x240): avg_latency={d} us/frame  max_throughput={d} fps\n",
+            .{ avg_us, max_fps },
+        );
+
+        // Also test HD 720p/1080p if available
+        const intro_path = "/Volumes/Skore/app_zig/assets/videos/intro_animation.mp4";
+        if (std.c.fopen(intro_path, "rb")) |intro_fp| {
+            _ = std.c.fclose(intro_fp);
+            var hd_st = ui.VideoPlayerState{};
+            defer hd_st.deinit();
+            hd_st.play(intro_path);
+
+            const t_hd = platform.profiler.nowNs();
+            for (0..num_frames) |_| {
+                _ = arena.reset(.retain_capacity);
+                uic.beginPass(.input, arena.allocator(), canvas, win_rect, 0, 0, false, false, false);
+                _ = uic.videoPlayer("bench_hd", 1280, 720, &hd_st, .{
+                    .file_path = intro_path,
+                    .raw_bytes = "",
+                });
+                uic.endPass();
+
+                uic.beginPass(.paint, arena.allocator(), canvas, win_rect, 0, 0, false, false, false);
+                _ = uic.videoPlayer("bench_hd", 1280, 720, &hd_st, .{
+                    .file_path = intro_path,
+                    .raw_bytes = "",
+                });
+                uic.endPass();
+            }
+            const dt_hd_ns = platform.profiler.nowNs() - t_hd;
+            const avg_hd_us = (dt_hd_ns / num_frames) / 1000;
+            const max_hd_fps = if (avg_hd_us > 0) 1_000_000 / avg_hd_us else 0;
+
+            // Measure isolated raw hardware frame decode cost (bypassing cache)
+            hd_st.pause();
+            var raw_extract_us: u64 = 0;
+            if (hd_st.native_generator_handle) |gen| {
+                const t_ext = platform.profiler.nowNs();
+                const num_ext = 10;
+                for (0..num_ext) |ei| {
+                    const t_sec = @as(f64, @floatFromInt(ei + 1)) * 0.25;
+                    if (ui.video_player_mod.macos_video.extractFrame(gen, t_sec)) |img| {
+                        img.deinit();
+                    }
+                }
+                raw_extract_us = ((platform.profiler.nowNs() - t_ext) / num_ext) / 1000;
+            }
+
+            // Measure AVPlayerItemVideoOutput hardware CVPixelBuffer acquisition latency
+            var hw_copy_us: u64 = 0;
+            if (hd_st.native_output_handle) |out| {
+                const t_hw = platform.profiler.nowNs();
+                const num_hw = 20;
+                var hw_frames: usize = 0;
+                for (0..num_hw) |hi| {
+                    const t_sec = @as(f64, @floatFromInt(hi)) * 0.016;
+                    if (ui.video_player_mod.macos_video.copyHardwareFrame(out, hd_st.native_sound_handle, t_sec)) |img| {
+                        img.deinit();
+                        hw_frames += 1;
+                    }
+                }
+                const dt_hw = platform.profiler.nowNs() - t_hw;
+                if (hw_frames > 0) {
+                    hw_copy_us = (dt_hw / hw_frames) / 1000;
+                }
+            }
+
+            std.debug.print(
+                "[10b. Video HD]     intro_animation.mp4 (720p): avg_latency={d} us/frame  hw_output={d} us/frame  thumb_decode={d} us/frame  max_throughput={d} fps\n",
+                .{ avg_hd_us, hw_copy_us, raw_extract_us, max_hd_fps },
+            );
+        }
+    }
+
     std.debug.print("================================================================================\n\n", .{});
 }

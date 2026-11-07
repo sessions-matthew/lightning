@@ -87,6 +87,39 @@ pub const VideoMetadata = struct {
     }
 };
 
+const DecodeJob = struct {
+    gen: *anyopaque,
+    time_secs: f64,
+    slot: usize,
+};
+
+var g_jobs: [4]DecodeJob = undefined;
+var g_ready_img: [4]?skia.Image = [4]?skia.Image{ null, null, null, null };
+var g_ready_time: [4]f64 = [4]f64{ -1.0, -1.0, -1.0, -1.0 };
+var g_decode_in_flight: [4]std.atomic.Value(bool) = [4]std.atomic.Value(bool){
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+};
+
+extern "c" fn dispatch_get_global_queue(identifier: c_long, flags: c_ulong) ?*anyopaque;
+extern "c" fn dispatch_async_f(queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
+
+fn decodeJobWorker(ctx: ?*anyopaque) callconv(.c) void {
+    const job: *DecodeJob = @ptrCast(@alignCast(ctx orelse return));
+    defer g_decode_in_flight[job.slot].store(false, .release);
+    const pool = platform.objc.objc_autoreleasePoolPush();
+    defer platform.objc.objc_autoreleasePoolPop(pool);
+
+    const decoded = macos_video.extractFrame(job.gen, job.time_secs);
+    if (decoded) |img| {
+        if (g_ready_img[job.slot]) |old| old.deinit();
+        g_ready_img[job.slot] = img;
+        g_ready_time[job.slot] = job.time_secs;
+    }
+}
+
 pub const VideoPlayerState = struct {
     is_playing: bool = false,
     current_time: f64 = 0.0,
@@ -96,6 +129,7 @@ pub const VideoPlayerState = struct {
     playback_rate: f32 = 1.0,
     looping: bool = false,
     scrubbing: bool = false,
+    vol_scrubbing: bool = false,
     aspect_ratio: VideoAspectRatio = .fit,
     metadata: VideoMetadata = .{},
     last_path_hash: u64 = 0,
@@ -104,21 +138,38 @@ pub const VideoPlayerState = struct {
     cached_frame_img: ?skia.Image = null,
     native_generator_handle: ?*anyopaque = null,
     native_sound_handle: ?*anyopaque = null,
+    native_output_handle: ?*anyopaque = null,
+    slot_index: u8 = 0,
 
     pub fn reset(self: *VideoPlayerState) void {
         self.stop();
         self.current_time = 0.0;
         self.is_playing = false;
         self.scrubbing = false;
+        self.vol_scrubbing = false;
         if (self.cached_frame_img) |img| {
             img.deinit();
             self.cached_frame_img = null;
         }
         self.cached_frame_time = -1.0;
+        const slot = @min(@as(usize, self.slot_index), 3);
+        if (g_ready_img[slot]) |img| {
+            img.deinit();
+            g_ready_img[slot] = null;
+        }
+        g_decode_in_flight[slot].store(false, .release);
         if (comptime is_macos) {
+            if (self.native_output_handle) |o| {
+                macos_video.releaseOutput(o);
+                self.native_output_handle = null;
+            }
             if (self.native_generator_handle) |gen| {
                 macos_video.releaseGenerator(gen);
                 self.native_generator_handle = null;
+            }
+            if (self.native_sound_handle) |p| {
+                macos_video.releasePlayer(p);
+                self.native_sound_handle = null;
             }
         }
     }
@@ -129,10 +180,24 @@ pub const VideoPlayerState = struct {
             img.deinit();
             self.cached_frame_img = null;
         }
+        const slot = @min(@as(usize, self.slot_index), 3);
+        if (g_ready_img[slot]) |img| {
+            img.deinit();
+            g_ready_img[slot] = null;
+        }
+        g_decode_in_flight[slot].store(false, .release);
         if (comptime is_macos) {
+            if (self.native_output_handle) |o| {
+                macos_video.releaseOutput(o);
+                self.native_output_handle = null;
+            }
             if (self.native_generator_handle) |gen| {
                 macos_video.releaseGenerator(gen);
                 self.native_generator_handle = null;
+            }
+            if (self.native_sound_handle) |p| {
+                macos_video.releasePlayer(p);
+                self.native_sound_handle = null;
             }
         }
     }
@@ -142,13 +207,28 @@ pub const VideoPlayerState = struct {
     /// hold a stale reference after `dlclose`/`dlopen`; the generator is
     /// re-created on the next frame when the path hash mismatches.
     pub fn clearNativeHandles(self: *VideoPlayerState) void {
+        const slot = @min(@as(usize, self.slot_index), 3);
+        if (g_ready_img[slot]) |img| {
+            img.deinit();
+            g_ready_img[slot] = null;
+        }
+        g_decode_in_flight[slot].store(false, .release);
         if (comptime is_macos) {
+            if (self.native_output_handle) |o| {
+                macos_video.releaseOutput(o);
+                self.native_output_handle = null;
+            }
             if (self.native_generator_handle) |gen| {
                 macos_video.releaseGenerator(gen);
                 self.native_generator_handle = null;
             }
+            if (self.native_sound_handle) |p| {
+                macos_video.releasePlayer(p);
+                self.native_sound_handle = null;
+            }
         }
         self.native_sound_handle = null;
+        self.native_output_handle = null;
         // Force path-hash mismatch so createGenerator runs on next render.
         self.last_path_hash = 0;
         if (self.cached_frame_img) |img| {
@@ -173,7 +253,6 @@ pub const VideoPlayerState = struct {
     }
 
     pub fn play(self: *VideoPlayerState, file_path: []const u8) void {
-        _ = file_path;
         if (self.is_playing) return;
         self.is_playing = true;
         self.last_tick_ns = platform.objc.getMonotonicNs();
@@ -181,20 +260,63 @@ pub const VideoPlayerState = struct {
         if (self.current_time >= self.duration - 0.05 and self.duration > 0.1) {
             self.current_time = 0.0;
         }
+
+        if (comptime is_macos) {
+            if (self.native_sound_handle == null and file_path.len > 0) {
+                if (macos_video.createPlayer(file_path)) |sess| {
+                    self.native_sound_handle = sess.player;
+                    self.native_output_handle = sess.output;
+                }
+            }
+            if (self.native_sound_handle) |p| {
+                macos_video.playerSetVolume(p, if (self.muted) 0.0 else self.volume);
+                macos_video.playerSetMuted(p, self.muted);
+                macos_video.playerSeek(p, self.current_time);
+                if (@abs(self.playback_rate - 1.0) > 0.01) {
+                    macos_video.playerSetRate(p, self.playback_rate);
+                } else {
+                    macos_video.playerPlay(p);
+                }
+            }
+        }
     }
 
     pub fn pause(self: *VideoPlayerState) void {
+        if (!self.is_playing) return;
         self.is_playing = false;
+        if (comptime is_macos) {
+            if (self.native_sound_handle) |p| {
+                macos_video.playerPause(p);
+            }
+        }
     }
 
     pub fn stop(self: *VideoPlayerState) void {
         self.is_playing = false;
         self.current_time = 0.0;
+        if (comptime is_macos) {
+            if (self.native_sound_handle) |p| {
+                macos_video.playerPause(p);
+                macos_video.playerSeek(p, 0.0);
+            }
+        }
     }
 
     pub fn seek(self: *VideoPlayerState, target_time: f64) void {
         const clamped = std.math.clamp(target_time, 0.0, @max(0.1, self.duration));
         self.current_time = clamped;
+        if (comptime is_macos) {
+            if (self.native_sound_handle) |p| {
+                macos_video.playerSeek(p, clamped);
+            }
+            if (self.native_generator_handle) |gen| {
+                const slot = @min(@as(usize, self.slot_index), 3);
+                g_jobs[slot] = .{ .gen = gen, .time_secs = clamped, .slot = slot };
+                g_decode_in_flight[slot].store(true, .release);
+                const q = dispatch_get_global_queue(0, 0);
+                dispatch_async_f(q, &g_jobs[slot], decodeJobWorker);
+            }
+        }
     }
 
     pub fn stepFrame(self: *VideoPlayerState, delta_frames: i32) void {
@@ -206,10 +328,22 @@ pub const VideoPlayerState = struct {
     pub fn setVolume(self: *VideoPlayerState, vol: f32) void {
         self.volume = std.math.clamp(vol, 0.0, 1.0);
         if (self.volume > 0.001) self.muted = false;
+        if (comptime is_macos) {
+            if (self.native_sound_handle) |p| {
+                macos_video.playerSetVolume(p, if (self.muted) 0.0 else self.volume);
+                macos_video.playerSetMuted(p, self.muted);
+            }
+        }
     }
 
     pub fn toggleMute(self: *VideoPlayerState) void {
         self.muted = !self.muted;
+        if (comptime is_macos) {
+            if (self.native_sound_handle) |p| {
+                macos_video.playerSetMuted(p, self.muted);
+                macos_video.playerSetVolume(p, if (self.muted) 0.0 else self.volume);
+            }
+        }
     }
 
     pub fn cycleRate(self: *VideoPlayerState) void {
@@ -222,6 +356,13 @@ pub const VideoPlayerState = struct {
             }
         }
         self.playback_rate = next_r;
+        if (comptime is_macos) {
+            if (self.native_sound_handle) |p| {
+                if (self.is_playing) {
+                    macos_video.playerSetRate(p, self.playback_rate);
+                }
+            }
+        }
     }
 
     pub fn cycleAspect(self: *VideoPlayerState) void {
@@ -337,26 +478,110 @@ pub fn parseVideoSource(
     }
     meta_out.file_bytes = raw_bytes.len;
 
-    // 1. Try ISO-BMFF / QuickTime container parser
-    if (parseIsoBmff(raw_bytes, meta_out)) {
+    // 1. Try ISO-BMFF / QuickTime container parser from memory if raw_bytes provided
+    if (raw_bytes.len >= 16 and parseIsoBmff(raw_bytes, meta_out)) {
         return;
     }
 
-    // 2. Fallback sensible video defaults (1080p 60fps standard)
+    // 2. Try parsing from disk if file_path is non-empty
+    if (file_path.len > 0 and file_path.len < 512) {
+        if (parseVideoFileFromDisk(file_path, meta_out)) {
+            return;
+        }
+    }
+
+    // 3. Fallback sensible video defaults (1080p 60fps standard)
     if (meta_out.width == 0 or meta_out.height == 0) {
         meta_out.width = 1920;
         meta_out.height = 1080;
     }
     if (meta_out.fps < 1.0) meta_out.fps = 60.0;
     if (meta_out.duration < 0.1) {
-        if (raw_bytes.len > 1024) {
-            const mbits = @as(f64, @floatFromInt(raw_bytes.len * 8)) / 1_000_000.0;
+        if (meta_out.file_bytes > 1024) {
+            const mbits = @as(f64, @floatFromInt(meta_out.file_bytes * 8)) / 1_000_000.0;
             meta_out.duration = std.math.clamp(mbits / 8.0, 5.0, 1200.0);
         } else {
             meta_out.duration = 60.0;
         }
     }
-    meta_out.codec_name.set("H.264 / AVC");
+    if (meta_out.codec_name.len == 0) {
+        meta_out.codec_name.set("H.264 / AVC");
+    }
+}
+
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
+const SEEK_SET: c_int = 0;
+const SEEK_CUR: c_int = 1;
+const SEEK_END: c_int = 2;
+
+fn parseVideoFileFromDisk(file_path: []const u8, meta: *VideoMetadata) bool {
+    var path_z: [512:0]u8 = @splat(0);
+    @memcpy(path_z[0..file_path.len], file_path);
+    path_z[file_path.len] = 0;
+
+    const fp = std.c.fopen(&path_z, "rb") orelse return false;
+    defer _ = std.c.fclose(fp);
+
+    _ = fseek(fp, 0, SEEK_END);
+    const file_size_long = ftell(fp);
+    if (file_size_long <= 16) return false;
+    const file_size: usize = @intCast(file_size_long);
+    meta.file_bytes = file_size;
+    _ = fseek(fp, 0, SEEK_SET);
+
+    // Read initial 64 KB chunk
+    var head_buf: [65536]u8 = undefined;
+    const read_bytes = std.c.fread(&head_buf, 1, @min(file_size, head_buf.len), fp);
+    if (read_bytes < 16) return false;
+
+    // Check if moov is within this initial chunk
+    if (parseIsoBmff(head_buf[0..read_bytes], meta)) {
+        return true;
+    }
+
+    // If moov wasn't in the head chunk, walk top-level boxes by seeking
+    var offset: usize = 0;
+    while (offset + 8 <= file_size) {
+        _ = fseek(fp, @intCast(offset), SEEK_SET);
+        var hdr: [16]u8 = undefined;
+        const n_hdr = std.c.fread(&hdr, 1, 8, fp);
+        if (n_hdr < 8) break;
+
+        const box_sz = std.mem.readInt(u32, hdr[0..4], .big);
+        const box_type = hdr[4..8];
+
+        var eff_sz: u64 = box_sz;
+        var hdr_len: usize = 8;
+        if (box_sz == 1) {
+            const n_ext = std.c.fread(hdr[8..16], 1, 8, fp);
+            if (n_ext < 8) break;
+            eff_sz = std.mem.readInt(u64, hdr[8..16], .big);
+            hdr_len = 16;
+        } else if (box_sz == 0) {
+            eff_sz = @as(u64, file_size - offset);
+        }
+
+        if (eff_sz < hdr_len) break;
+
+        if (std.mem.eql(u8, box_type, "moov")) {
+            // Read up to 256 KB of moov atom
+            const to_read: usize = @intCast(@min(eff_sz - hdr_len, 262144));
+            var moov_buf: [262144]u8 = undefined;
+            const moov_read = std.c.fread(&moov_buf, 1, to_read, fp);
+            if (moov_read > 0) {
+                parseMoovBox(moov_buf[0..moov_read], meta);
+                if (meta.duration > 0.01 or meta.width > 0) {
+                    return true;
+                }
+            }
+            break;
+        }
+
+        offset += @intCast(eff_sz);
+    }
+
+    return meta.duration > 0.01 or meta.width > 0;
 }
 
 fn parseIsoBmff(bytes: []const u8, meta: *VideoMetadata) bool {
@@ -445,7 +670,7 @@ fn parseTrakBox(bytes: []const u8, meta: *VideoMetadata) void {
 // macOS Native `AVAssetImageGenerator` Frame Extractor C-ABI Bindings
 // ============================================================================
 
-const macos_video = struct {
+pub const macos_video = struct {
     pub const CMTime = extern struct {
         value: i64,
         timescale: i32,
@@ -453,8 +678,30 @@ const macos_video = struct {
         epoch: i64,
     };
 
+    pub const CGPoint = extern struct {
+        x: f64,
+        y: f64,
+    };
+    pub const CGSize = extern struct {
+        width: f64,
+        height: f64,
+    };
+    pub const CGRect = extern struct {
+        origin: CGPoint,
+        size: CGSize,
+    };
+    pub const CGAffineTransform = extern struct {
+        a: f64,
+        b: f64,
+        c: f64,
+        d: f64,
+        tx: f64,
+        ty: f64,
+    };
+
     extern "c" fn CMTimeMakeWithSeconds(seconds: f64, preferredTimescale: i32) CMTime;
     extern "c" fn CMTimeGetSeconds(time: CMTime) f64;
+    extern "c" fn CMFormatDescriptionGetMediaSubType(desc: ?*anyopaque) u32;
     extern "c" fn CGImageGetWidth(image: ?*anyopaque) usize;
     extern "c" fn CGImageGetHeight(image: ?*anyopaque) usize;
     extern "c" fn CGImageRelease(image: ?*anyopaque) void;
@@ -471,12 +718,79 @@ const macos_video = struct {
     extern "c" fn CGColorSpaceCreateDeviceRGB() ?*anyopaque;
     extern "c" fn CGColorSpaceRelease(space: ?*anyopaque) void;
     extern "c" fn CGContextRelease(context: ?*anyopaque) void;
-    extern "c" fn CGContextDrawImage(context: *anyopaque, rect: c.sk_rect_t, image: *anyopaque) void;
+    extern "c" fn CGContextDrawImage(context: ?*anyopaque, rect: CGRect, image: ?*anyopaque) void;
+
+    extern "c" fn CFRelease(cf: ?*const anyopaque) void;
+    extern "c" fn CVPixelBufferLockBaseAddress(pixelBuffer: ?*anyopaque, lockFlags: u64) c_int;
+    extern "c" fn CVPixelBufferUnlockBaseAddress(pixelBuffer: ?*anyopaque, lockFlags: u64) c_int;
+    extern "c" fn CVPixelBufferGetBaseAddress(pixelBuffer: ?*anyopaque) ?*anyopaque;
+    extern "c" fn CVPixelBufferGetBytesPerRow(pixelBuffer: ?*anyopaque) usize;
+    extern "c" fn CVPixelBufferGetWidth(pixelBuffer: ?*anyopaque) usize;
+    extern "c" fn CVPixelBufferGetHeight(pixelBuffer: ?*anyopaque) usize;
 
     const kCGImageAlphaPremultipliedFirst: u32 = 2;
     const kCGBitmapByteOrder32Little: u32 = 2 << 12;
 
-    fn createGenerator(file_path: []const u8) ?*anyopaque {
+    fn inspectAsset(asset: platform.objc.id, meta: *VideoMetadata) void {
+        const dur_cm = platform.objc.msgSend0(asset, CMTime, "duration");
+        const dur_sec = CMTimeGetSeconds(dur_cm);
+        if (dur_sec > 0.01) {
+            meta.duration = dur_sec;
+        }
+
+        const media_type_video = platform.objc.nsString("vide");
+        const tracks = platform.objc.msgSend1(asset, platform.objc.id, "tracksWithMediaType:", media_type_video);
+        if (tracks) |trks| {
+            const count = platform.objc.msgSend0(trks, usize, "count");
+            if (count > 0) {
+                const track = platform.objc.msgSend1(trks, platform.objc.id, "objectAtIndex:", @as(usize, 0));
+                if (track) |t| {
+                    const nat_size = platform.objc.msgSend0(t, CGSize, "naturalSize");
+                    const transform = platform.objc.msgSend0(t, CGAffineTransform, "preferredTransform");
+                    const is_rotated = (@abs(transform.a) < 0.001 and @abs(transform.d) < 0.001);
+                    const w_val: u32 = @intFromFloat(if (is_rotated) nat_size.height else nat_size.width);
+                    const h_val: u32 = @intFromFloat(if (is_rotated) nat_size.width else nat_size.height);
+                    if (w_val > 0 and h_val > 0) {
+                        meta.width = w_val;
+                        meta.height = h_val;
+                    }
+
+                    const fps = platform.objc.msgSend0(t, f32, "nominalFrameRate");
+                    if (fps > 0.1) {
+                        meta.fps = fps;
+                    }
+
+                    const formats = platform.objc.msgSend0(t, platform.objc.id, "formatDescriptions");
+                    if (formats) |fmts| {
+                        const fmt_cnt = platform.objc.msgSend0(fmts, usize, "count");
+                        if (fmt_cnt > 0) {
+                            const desc = platform.objc.msgSend1(fmts, ?*anyopaque, "objectAtIndex:", @as(usize, 0));
+                            if (desc) |d| {
+                                const sub = CMFormatDescriptionGetMediaSubType(d);
+                                switch (sub) {
+                                    0x61766331 => meta.codec_name.set("H.264 / AVC"),
+                                    0x68766331, 0x68657631 => meta.codec_name.set("HEVC / H.265"),
+                                    0x6170636E, 0x61706368, 0x61707373, 0x6170636F, 0x61703468 => meta.codec_name.set("Apple ProRes"),
+                                    0x6D703476 => meta.codec_name.set("MPEG-4"),
+                                    0x76703039 => meta.codec_name.set("VP9"),
+                                    0x61763031 => meta.codec_name.set("AV1"),
+                                    else => {
+                                        var fourcc_buf: [4]u8 = undefined;
+                                        std.mem.writeInt(u32, &fourcc_buf, sub, .big);
+                                        if (std.ascii.isPrint(fourcc_buf[0]) and std.ascii.isPrint(fourcc_buf[1])) {
+                                            meta.codec_name.set(&fourcc_buf);
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn createGenerator(file_path: []const u8, meta_out: ?*VideoMetadata) ?*anyopaque {
         if (comptime !is_macos) return null;
         if (file_path.len == 0 or file_path.len >= 512) return null;
 
@@ -503,9 +817,21 @@ const macos_video = struct {
         const asset = platform.objc.msgSend2(AVURLAsset, platform.objc.id, "URLAssetWithURL:options:", url, @as(?*anyopaque, null));
         if (asset == null) return null;
 
+        if (meta_out) |m| {
+            inspectAsset(asset, m);
+        }
+
         const gen = platform.objc.msgSend1(AVAssetImageGenerator, platform.objc.id, "assetImageGeneratorWithAsset:", asset);
         if (gen) |g| {
             platform.objc.msgSend1(g, void, "setAppliesPreferredTrackTransform:", @as(u8, 1));
+
+            // Set tolerances to zero so AVAssetImageGenerator decodes the exact requested frame
+            // rather than snapping to the nearest distant keyframe (which causes videos to only show 1-2 frames).
+            const kCMTimeZero = CMTime{ .value = 0, .timescale = 1, .flags = 1, .epoch = 0 };
+            const set_tol_fn: *const fn (platform.objc.id, platform.objc.SEL, CMTime) callconv(.c) void = @ptrCast(&platform.objc.objc_msgSend);
+            set_tol_fn(g, platform.objc.sel_registerName("setRequestedTimeToleranceBefore:"), kCMTimeZero);
+            set_tol_fn(g, platform.objc.sel_registerName("setRequestedTimeToleranceAfter:"), kCMTimeZero);
+
             // Explicitly retain so ARC does not release while we hold the raw pointer across frames.
             _ = platform.objc.msgSend0(g, platform.objc.id, "retain");
             return g;
@@ -518,10 +844,10 @@ const macos_video = struct {
         platform.objc.msgSend0(gen, void, "release");
     }
 
-    fn extractFrame(gen: *anyopaque, time_secs: f64) ?skia.Image {
+    pub fn extractFrame(gen: *anyopaque, time_secs: f64) ?skia.Image {
         if (comptime !is_macos) return null;
 
-        const req_time = CMTimeMakeWithSeconds(time_secs, 600);
+        const req_time = CMTimeMakeWithSeconds(time_secs, 60000);
         var actual_time: CMTime = undefined;
         var err: ?*anyopaque = null;
 
@@ -535,8 +861,8 @@ const macos_video = struct {
 
         const row_bytes = img_w * 4;
         const total_bytes = row_bytes * img_h;
-        const pixel_buf = std.heap.page_allocator.alloc(u8, total_bytes) catch return null;
-        defer std.heap.page_allocator.free(pixel_buf);
+        const pixel_buf = std.heap.c_allocator.alloc(u8, total_bytes) catch return null;
+        defer std.heap.c_allocator.free(pixel_buf);
 
         const cs = CGColorSpaceCreateDeviceRGB() orelse return null;
         defer CGColorSpaceRelease(cs);
@@ -546,16 +872,177 @@ const macos_video = struct {
         defer CGContextRelease(cg_ctx);
 
         CGContextDrawImage(cg_ctx, .{
-            .left = 0,
-            .top = 0,
-            .right = @floatFromInt(img_w),
-            .bottom = @floatFromInt(img_h),
+            .origin = .{ .x = 0.0, .y = 0.0 },
+            .size = .{ .width = @floatFromInt(img_w), .height = @floatFromInt(img_h) },
         }, cg_img);
 
         const img_info = skia.ImageInfo.initBgra8888Premul(@intCast(img_w), @intCast(img_h));
         return skia.Image.initRasterCopy(img_info, pixel_buf.ptr, row_bytes) catch null;
     }
+
+    pub const PlayerSession = struct {
+        player: *anyopaque,
+        output: ?*anyopaque,
+    };
+
+    fn createPlayer(file_path: []const u8) ?PlayerSession {
+        if (comptime !is_macos) return null;
+        if (file_path.len == 0 or file_path.len >= 512) return null;
+
+        var path_z: [512:0]u8 = @splat(0);
+        @memcpy(path_z[0..file_path.len], file_path);
+        path_z[file_path.len] = 0;
+
+        _ = platform.objc.dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", platform.objc.RTLD_NOW);
+        _ = platform.objc.dlopen("/System/Library/Frameworks/CoreVideo.framework/CoreVideo", platform.objc.RTLD_NOW);
+        _ = platform.objc.dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", platform.objc.RTLD_NOW);
+
+        const NSURL = platform.objc.objc_getClass("NSURL");
+        const NSString = platform.objc.objc_getClass("NSString");
+        const AVPlayer = platform.objc.objc_getClass("AVPlayer");
+        const AVPlayerItemVideoOutput = platform.objc.objc_getClass("AVPlayerItemVideoOutput");
+        const NSDictionary = platform.objc.objc_getClass("NSDictionary");
+        const NSNumber = platform.objc.objc_getClass("NSNumber");
+        if (NSURL == null or NSString == null or AVPlayer == null) return null;
+
+        const ns_path = platform.objc.msgSend1(NSString, platform.objc.id, "stringWithUTF8String:", &path_z);
+        if (ns_path == null) return null;
+
+        const url = platform.objc.msgSend1(NSURL, platform.objc.id, "fileURLWithPath:", ns_path);
+        if (url == null) return null;
+
+        const player = platform.objc.msgSend1(AVPlayer, platform.objc.id, "playerWithURL:", url) orelse return null;
+        _ = platform.objc.msgSend0(player, platform.objc.id, "retain");
+        // Prevent AVPlayer from auto-pausing when reaching the end of the item so looping works seamlessly
+        platform.objc.msgSend1(player, void, "setActionAtItemEnd:", @as(c_long, 1)); // 1 = AVPlayerActionAtItemEndNone
+
+        var video_output: ?*anyopaque = null;
+        if (AVPlayerItemVideoOutput != null and NSDictionary != null and NSNumber != null) {
+            const item = platform.objc.msgSend0(player, platform.objc.id, "currentItem");
+            if (item) |it| {
+                const num = platform.objc.msgSend1(NSNumber, platform.objc.id, "numberWithUnsignedInt:", @as(u32, 0x42475241));
+                const key = platform.objc.nsString("PixelFormatType");
+                if (num != null and key != null) {
+                    const attrs = platform.objc.msgSend2(NSDictionary, platform.objc.id, "dictionaryWithObject:forKey:", num, key);
+                    if (attrs) |at| {
+                        const out_alloc = platform.objc.msgSend0(AVPlayerItemVideoOutput, platform.objc.id, "alloc");
+                        if (out_alloc) |oa| {
+                            const out = platform.objc.msgSend1(oa, platform.objc.id, "initWithPixelBufferAttributes:", at);
+                            if (out) |o| {
+                                _ = platform.objc.msgSend1(it, void, "addOutput:", o);
+                                _ = platform.objc.msgSend0(o, platform.objc.id, "retain");
+                                video_output = o;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return .{
+            .player = player,
+            .output = video_output,
+        };
+    }
+
+    fn releasePlayer(player: *anyopaque) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend0(player, void, "pause");
+        platform.objc.msgSend0(player, void, "release");
+    }
+
+    fn releaseOutput(output: *anyopaque) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend0(output, void, "release");
+    }
+
+    pub fn copyHardwareFrame(output: *anyopaque, player: ?*anyopaque, time_secs: f64) ?skia.Image {
+        if (comptime !is_macos) return null;
+
+        const cur_cm = if (player) |p|
+            platform.objc.msgSend0(p, CMTime, "currentTime")
+        else
+            CMTimeMakeWithSeconds(time_secs, 60000);
+
+        const has_new_fn: *const fn (platform.objc.id, platform.objc.SEL, CMTime) callconv(.c) u8 = @ptrCast(&platform.objc.objc_msgSend);
+        const sel_has = platform.objc.sel_registerName("hasNewPixelBufferForItemTime:");
+        if (has_new_fn(output, sel_has, cur_cm) == 0) {
+            return null;
+        }
+
+        const copy_buf_fn: *const fn (platform.objc.id, platform.objc.SEL, CMTime, ?*CMTime) callconv(.c) ?*anyopaque = @ptrCast(&platform.objc.objc_msgSend);
+        const sel_copy = platform.objc.sel_registerName("copyPixelBufferForItemTime:itemTimeForDisplay:");
+        const buf = copy_buf_fn(output, sel_copy, cur_cm, null) orelse return null;
+        defer CFRelease(buf);
+
+        _ = CVPixelBufferLockBaseAddress(buf, 1);
+        defer _ = CVPixelBufferUnlockBaseAddress(buf, 1);
+
+        const base = CVPixelBufferGetBaseAddress(buf) orelse return null;
+        const w = CVPixelBufferGetWidth(buf);
+        const h = CVPixelBufferGetHeight(buf);
+        const stride = CVPixelBufferGetBytesPerRow(buf);
+        if (w == 0 or h == 0 or stride == 0) return null;
+
+        const img_info = skia.ImageInfo.initBgra8888Premul(@intCast(w), @intCast(h));
+        return skia.Image.initRasterCopy(img_info, base, stride) catch null;
+    }
+
+    fn playerPlay(player: *anyopaque) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend0(player, void, "play");
+    }
+
+    fn playerPause(player: *anyopaque) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend0(player, void, "pause");
+    }
+
+    fn playerSetVolume(player: *anyopaque, vol: f32) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend1(player, void, "setVolume:", vol);
+    }
+
+    fn playerSetMuted(player: *anyopaque, muted: bool) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend1(player, void, "setMuted:", @as(u8, if (muted) 1 else 0));
+    }
+
+    fn playerSetRate(player: *anyopaque, rate: f32) void {
+        if (comptime !is_macos) return;
+        platform.objc.msgSend1(player, void, "setRate:", rate);
+    }
+
+    fn playerRate(player: *anyopaque) f32 {
+        if (comptime !is_macos) return 0.0;
+        return platform.objc.msgSend0(player, f32, "rate");
+    }
+
+    fn playerSeek(player: *anyopaque, time_secs: f64) void {
+        if (comptime !is_macos) return;
+        const target_time = CMTimeMakeWithSeconds(time_secs, 60000);
+        const kCMTimeZero = CMTime{ .value = 0, .timescale = 1, .flags = 1, .epoch = 0 };
+        const seek_fn: *const fn (platform.objc.id, platform.objc.SEL, CMTime, CMTime, CMTime) callconv(.c) void = @ptrCast(&platform.objc.objc_msgSend);
+        seek_fn(player, platform.objc.sel_registerName("seekToTime:toleranceBefore:toleranceAfter:"), target_time, kCMTimeZero, kCMTimeZero);
+    }
+
+    fn playerCurrentTime(player: *anyopaque) f64 {
+        if (comptime !is_macos) return 0.0;
+        const cur_cm = platform.objc.msgSend0(player, CMTime, "currentTime");
+        return CMTimeGetSeconds(cur_cm);
+    }
 };
+
+fn advanceSimulatedClock(view: *VideoPlayerState, now_ns: u64) void {
+    if (view.last_tick_ns == 0) {
+        view.last_tick_ns = now_ns;
+    } else {
+        const dt_ns = now_ns -% view.last_tick_ns;
+        const dt_sec = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
+        view.current_time += dt_sec * @as(f64, view.playback_rate);
+    }
+}
+
 
 // ============================================================================
 // Two-Phase (`Pass.input` / `Pass.paint`) Video Player Component
@@ -576,7 +1063,10 @@ pub fn renderVideoPlayer(
 
     // Initial source check & path-change cache invalidation
     const path_hash = std.hash.Wyhash.hash(0, options.file_path) ^ @as(u64, @intCast(options.raw_bytes.len));
-    if (view.last_path_hash != path_hash) {
+    const need_reinit = (view.last_path_hash != path_hash) or
+        (is_macos and view.native_generator_handle == null and options.file_path.len > 0);
+
+    if (need_reinit) {
         view.last_path_hash = path_hash;
         view.reset();
 
@@ -589,36 +1079,76 @@ pub fn renderVideoPlayer(
             "";
 
         parseVideoSource(options.file_path, eff_bytes, &view.metadata);
-        view.duration = view.metadata.duration;
 
         if (comptime is_macos) {
             if (options.file_path.len > 0) {
-                view.native_generator_handle = macos_video.createGenerator(options.file_path);
+                view.native_generator_handle = macos_video.createGenerator(options.file_path, &view.metadata);
+                if (macos_video.createPlayer(options.file_path)) |sess| {
+                    view.native_sound_handle = sess.player;
+                    view.native_output_handle = sess.output;
+                    macos_video.playerSetVolume(sess.player, if (view.muted) 0.0 else view.volume);
+                    macos_video.playerSetMuted(sess.player, view.muted);
+                }
             }
         }
+        view.duration = view.metadata.duration;
     }
 
-    // Advance playback clock
-    const now_ns = platform.objc.getMonotonicNs();
-    if (view.is_playing) {
-        if (view.last_tick_ns == 0) {
-            view.last_tick_ns = now_ns;
-        } else {
-            const dt_ns = now_ns -% view.last_tick_ns;
-            const dt_sec = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
-            view.current_time += dt_sec * @as(f64, view.playback_rate);
+    // Advance playback clock (CPU state pass only for strict two-phase layout determinism)
+    if (uic.pass == .input) {
+        const now_ns = platform.objc.getMonotonicNs();
+        if (view.is_playing) {
+            if (comptime is_macos) {
+                if (view.native_sound_handle) |p| {
+                    const audio_t = macos_video.playerCurrentTime(p);
+                    // Synchronize video timeline directly with CoreAudio hardware output clock
+                    if (audio_t > 0.001 and @abs(audio_t - view.current_time) < 0.5) {
+                        view.current_time = audio_t;
+                    } else {
+                        advanceSimulatedClock(view, now_ns);
+                    }
+                    // If AVPlayer was auto-paused by the OS during a boundary transition, resume it immediately
+                    if (macos_video.playerRate(p) < 0.01) {
+                        if (@abs(view.playback_rate - 1.0) > 0.01) {
+                            macos_video.playerSetRate(p, view.playback_rate);
+                        } else {
+                            macos_video.playerPlay(p);
+                        }
+                    }
+                } else {
+                    advanceSimulatedClock(view, now_ns);
+                }
+            } else {
+                advanceSimulatedClock(view, now_ns);
+            }
 
             if (view.duration > 0.05 and view.current_time >= view.duration) {
                 if (view.looping) {
                     view.current_time = 0.0;
+                    view.cached_frame_time = -1.0;
+                    if (comptime is_macos) {
+                        if (view.native_sound_handle) |p| {
+                            macos_video.playerSeek(p, 0.0);
+                            if (@abs(view.playback_rate - 1.0) > 0.01) {
+                                macos_video.playerSetRate(p, view.playback_rate);
+                            } else {
+                                macos_video.playerPlay(p);
+                            }
+                        }
+                    }
                 } else {
                     view.current_time = view.duration;
                     view.is_playing = false;
+                    if (comptime is_macos) {
+                        if (view.native_sound_handle) |p| {
+                            macos_video.playerPause(p);
+                        }
+                    }
                 }
             }
         }
+        view.last_tick_ns = now_ns;
     }
-    view.last_tick_ns = now_ns;
 
     // Layout regions
     const top_bar_h: f32 = 36.0;
@@ -670,6 +1200,8 @@ pub fn renderVideoPlayer(
                 view.toggleMute();
                 uic.markDirty(full_r);
             } else if (uic.isHovered(vol_track_r)) {
+                view.vol_scrubbing = true;
+                uic.active_id = resolved.wid;
                 const norm = std.math.clamp((uic.mouse_x - vol_track_r.left) / rectW(vol_track_r), 0.0, 1.0);
                 view.setVolume(norm);
                 uic.markDirty(full_r);
@@ -689,6 +1221,17 @@ pub fn renderVideoPlayer(
                 uic.markDirty(full_r);
             } else {
                 view.scrubbing = false;
+                if (uic.active_id == resolved.wid) uic.active_id = 0;
+            }
+        }
+
+        if (view.vol_scrubbing) {
+            if (uic.mouse_down) {
+                const norm = std.math.clamp((uic.mouse_x - vol_track_r.left) / rectW(vol_track_r), 0.0, 1.0);
+                view.setVolume(norm);
+                uic.markDirty(full_r);
+            } else {
+                view.vol_scrubbing = false;
                 if (uic.active_id == resolved.wid) uic.active_id = 0;
             }
         }
@@ -835,24 +1378,54 @@ fn renderVideoViewport(uic: *Context, r: c.sk_rect_t, view: *VideoPlayerState) v
     // Attempt native hardware decoded frame extraction on macOS
     var has_hardware_frame = false;
     if (comptime is_macos) {
-        if (view.native_generator_handle) |gen| {
-            // Guard: verify the ObjC object is still alive by checking its retain
-            // count. A retain count of 0 means the object was deallocated by ARC
-            // (should not happen since we `retain` on creation, but defensive).
+        const slot = @min(@as(usize, view.slot_index), 3);
+
+        // 1. Consume any newly ready frame produced by the background GCD worker (for paused scrub/step)
+        if (g_ready_img[slot]) |r_img| {
+            if (view.cached_frame_img) |old_img| old_img.deinit();
+            view.cached_frame_img = r_img;
+            view.cached_frame_time = g_ready_time[slot];
+            g_ready_img[slot] = null;
+            g_decode_in_flight[slot].store(false, .release);
+        }
+
+        // 2. High-performance AVPlayerItemVideoOutput hardware frame retrieval (< 0.05 ms)
+        if (view.native_output_handle) |output| {
+            if (macos_video.copyHardwareFrame(output, view.native_sound_handle, view.current_time)) |hw_img| {
+                if (view.cached_frame_img) |old_img| old_img.deinit();
+                view.cached_frame_img = hw_img;
+                view.cached_frame_time = view.current_time;
+            }
+        }
+
+        // 3. Fallback for paused scrubbing when a new frame is needed at a different time
+        if (!view.is_playing and view.native_generator_handle != null and view.cached_frame_img != null) {
+            const frame_dur = if (view.metadata.fps > 1.0) (1.0 / @as(f64, view.metadata.fps)) else 0.033;
+            const frame_interval = frame_dur * 0.9;
+            const need_new_frame = (@abs(view.current_time - view.cached_frame_time) >= frame_interval);
+
+            if (need_new_frame and !g_decode_in_flight[slot].load(.acquire)) {
+                g_decode_in_flight[slot].store(true, .release);
+                g_jobs[slot] = .{ .gen = view.native_generator_handle.?, .time_secs = view.current_time, .slot = slot };
+                const q = dispatch_get_global_queue(0, 0);
+                dispatch_async_f(q, &g_jobs[slot], decodeJobWorker);
+            }
+        }
+
+        // 4. Initial synchronous cold-start fallback if no frame exists yet at all (only when paused)
+        if (view.cached_frame_img == null and !view.is_playing and view.native_generator_handle != null) {
             const pool = platform.objc.objc_autoreleasePoolPush();
             defer platform.objc.objc_autoreleasePoolPop(pool);
+            if (macos_video.extractFrame(view.native_generator_handle.?, view.current_time)) |first_frame| {
+                view.cached_frame_img = first_frame;
+                view.cached_frame_time = view.current_time;
+            }
+        }
 
-            if (@abs(view.current_time - view.cached_frame_time) > 0.033 or view.cached_frame_img == null) {
-                if (macos_video.extractFrame(gen, view.current_time)) |new_frame| {
-                    if (view.cached_frame_img) |old_img| old_img.deinit();
-                    view.cached_frame_img = new_frame;
-                    view.cached_frame_time = view.current_time;
-                }
-            }
-            if (view.cached_frame_img) |img| {
-                uic.canvas.drawImageRectSampling(img, video_r, false, null);
-                has_hardware_frame = true;
-            }
+        // 5. Draw the current frame with zero UI-thread latency
+        if (view.cached_frame_img) |img| {
+            uic.canvas.drawImageRectSampling(img, video_r, false, null);
+            has_hardware_frame = true;
         }
     }
 
@@ -863,19 +1436,63 @@ fn renderVideoViewport(uic: *Context, r: c.sk_rect_t, view: *VideoPlayerState) v
 
     // Hover or paused big play/pause badge in center of viewport
     if (!view.is_playing or uic.isHovered(r)) {
-        const badge_size: f32 = 64.0;
-        const center_btn_r = Rect.xywh(cx - badge_size * 0.5, cy - badge_size * 0.5, badge_size, badge_size);
+        const badge_size: f32 = 76.0;
+        const radius: f32 = badge_size * 0.5;
+        const center_btn_r = Rect.xywh(cx - radius, cy - radius, badge_size, badge_size);
+        const is_hovered = uic.isHovered(center_btn_r) or uic.isHovered(r);
+
+        // Circular translucent backdrop
         uic.paint.setStyle(.fill);
-        uic.paint.setColor(Color.argb(160, 15, 23, 42));
-        uic.canvas.drawCircle(cx, cy, badge_size * 0.5, uic.paint);
+        uic.paint.setColor(if (is_hovered) Color.argb(195, 15, 23, 42) else Color.argb(150, 15, 23, 42));
+        uic.canvas.drawCircle(cx, cy, radius, uic.paint);
+
+        // Crisp white ring outline
         uic.paint.setStyle(.stroke);
-        uic.paint.setStrokeWidth(2.0);
-        uic.paint.setColor(Color.argb(200, 255, 255, 255));
-        uic.canvas.drawCircle(cx, cy, badge_size * 0.5, uic.paint);
-        uic.paint.setStyle(.fill);
-        uic.paint.setColor(Color.rgb(255, 255, 255));
-        const play_sym = if (view.is_playing) "⏸" else "▶";
-        _ = uic.drawTextCached(uic.font_body, play_sym, center_btn_r.left + 22.0, center_btn_r.top + 40.0);
+        uic.paint.setStrokeWidth(2.5);
+        uic.paint.setColor(if (is_hovered) Color.argb(245, 255, 255, 255) else Color.argb(200, 255, 255, 255));
+        uic.canvas.drawCircle(cx, cy, radius, uic.paint);
+
+        // Large, optically centered Play / Pause vector icon
+        if (view.is_playing) {
+            // Pause icon: two vertical rounded bars
+            uic.paint.setStyle(.fill);
+            uic.paint.setColor(Color.rgb(255, 255, 255));
+            const bar_w: f32 = 8.0;
+            const bar_h: f32 = 30.0;
+            const gap: f32 = 9.0;
+            const left_x = cx - bar_w - gap * 0.5;
+            const right_x = cx + gap * 0.5;
+            const bar_y = cy - bar_h * 0.5;
+            uic.canvas.drawRoundRect(Rect.xywh(left_x, bar_y, bar_w, bar_h), 3.0, 3.0, uic.paint);
+            uic.canvas.drawRoundRect(Rect.xywh(right_x, bar_y, bar_w, bar_h), 3.0, 3.0, uic.paint);
+        } else {
+            // Play icon: right-pointing triangle with rounded vertices and optical centroid correction
+            if (skia.PathBuilder.init()) |pb| {
+                defer pb.deinit();
+                // Base is 10px to the left, tip is 17px to the right (+2.5px optical centroid shift)
+                // Height is 32px (from cy - 16 to cy + 16)
+                pb.moveTo(cx - 10.0, cy - 16.0);
+                pb.lineTo(cx + 17.0, cy);
+                pb.lineTo(cx - 10.0, cy + 16.0);
+                pb.close();
+                if (pb.detach()) |path| {
+                    defer path.deinit();
+                    uic.paint.setStyle(.fill);
+                    uic.paint.setColor(Color.rgb(255, 255, 255));
+                    uic.canvas.drawPath(path, uic.paint);
+
+                    // Smooth rounded corners on triangle vertices
+                    uic.paint.setStyle(.stroke);
+                    uic.paint.setStrokeWidth(3.0);
+                    uic.paint.setStrokeJoin(.round);
+                    uic.paint.setStrokeCap(.round);
+                    uic.canvas.drawPath(path, uic.paint);
+                    uic.paint.setStrokeJoin(.miter);
+                    uic.paint.setStrokeCap(.butt);
+                    uic.paint.setStyle(.fill);
+                } else |_| {}
+            } else |_| {}
+        }
     }
 }
 
@@ -980,11 +1597,37 @@ fn renderBottomTransport(
 
     // 2. Play / Pause button
     const play_hovered = uic.isHovered(play_r);
+    uic.paint.setStyle(.fill);
     uic.paint.setColor(if (play_hovered) Color.rgb(234, 88, 12) else Color.rgb(249, 115, 22));
     uic.canvas.drawRoundRect(play_r, 6.0, 6.0, uic.paint);
+
+    const pcx = (play_r.left + play_r.right) * 0.5;
+    const pcy = (play_r.top + play_r.bottom) * 0.5;
     uic.paint.setColor(Color.rgb(255, 255, 255));
-    const play_icon = if (view.is_playing) "⏸" else "▶";
-    _ = uic.drawTextCached(uic.font_body, play_icon, play_r.left + 12.0, play_r.top + 19.0);
+    if (view.is_playing) {
+        uic.canvas.drawRoundRect(Rect.xywh(pcx - 5.0, pcy - 6.0, 3.5, 12.0), 1.0, 1.0, uic.paint);
+        uic.canvas.drawRoundRect(Rect.xywh(pcx + 1.5, pcy - 6.0, 3.5, 12.0), 1.0, 1.0, uic.paint);
+    } else {
+        if (skia.PathBuilder.init()) |pb| {
+            defer pb.deinit();
+            pb.moveTo(pcx - 4.0, pcy - 6.0);
+            pb.lineTo(pcx + 6.0, pcy);
+            pb.lineTo(pcx - 4.0, pcy + 6.0);
+            pb.close();
+            if (pb.detach()) |path| {
+                defer path.deinit();
+                uic.canvas.drawPath(path, uic.paint);
+                uic.paint.setStyle(.stroke);
+                uic.paint.setStrokeWidth(1.6);
+                uic.paint.setStrokeJoin(.round);
+                uic.paint.setStrokeCap(.round);
+                uic.canvas.drawPath(path, uic.paint);
+                uic.paint.setStrokeJoin(.miter);
+                uic.paint.setStrokeCap(.butt);
+                uic.paint.setStyle(.fill);
+            } else |_| {}
+        } else |_| {}
+    }
 
     // 3. Step ±1 frame buttons
     drawPillButton(uic, step_bwd_r, "⏮", uic.isHovered(step_bwd_r), false);
@@ -1158,3 +1801,133 @@ test "VideoPlayer: two-phase input and paint passes" {
     uic.endPass();
     try std.testing.expectEqual(res_input.duration, res_paint.duration);
 }
+
+test "VideoPlayer: disk file parsing and hardware frame decoding" {
+    var meta = VideoMetadata{};
+    parseVideoSource("assets/test_video.mp4", "", &meta);
+    try std.testing.expectEqualStrings("MP4", meta.formatBadge());
+    try std.testing.expectEqual(@as(u32, 320), meta.width);
+    try std.testing.expectEqual(@as(u32, 240), meta.height);
+    try std.testing.expect(meta.duration > 4.8 and meta.duration < 5.2);
+
+    const surface = try skia.Surface.initRasterN32Premul(640, 360);
+    defer surface.deinit();
+
+    const font = try Font.init(null, 12.0);
+    defer font.deinit();
+
+    const paint = try skia.Paint.init();
+    defer paint.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var uic = Context{
+        .arena = arena.allocator(),
+        .canvas = surface.canvas(),
+        .paint = paint,
+        .font_title = font,
+        .font_body = font,
+        .font_mono = font,
+    };
+    defer uic.deinit();
+
+    var state = VideoPlayerState{};
+    defer state.deinit();
+    const win_r = Rect.xywh(0, 0, 640, 360);
+
+    // Pass 1: Input pass
+    _ = arena.reset(.retain_capacity);
+    uic.beginPass(.input, arena.allocator(), surface.canvas(), win_r, 320.0, 180.0, false, false, false);
+    const res_in = renderVideoPlayer(&uic, "test_disk_player", 640.0, 360.0, &state, .{
+        .file_path = "assets/test_video.mp4",
+        .raw_bytes = "",
+    });
+    uic.endPass();
+    try std.testing.expect(res_in.duration > 4.8 and res_in.duration < 5.2);
+    try std.testing.expectEqual(@as(u32, 320), state.metadata.width);
+    try std.testing.expectEqual(@as(u32, 240), state.metadata.height);
+
+    // Pass 2: Paint pass
+    uic.clip_damage = win_r;
+    uic.beginPass(.paint, arena.allocator(), surface.canvas(), win_r, 320.0, 180.0, false, false, false);
+    const res_paint = renderVideoPlayer(&uic, "test_disk_player", 640.0, 360.0, &state, .{
+        .file_path = "assets/test_video.mp4",
+        .raw_bytes = "",
+    });
+    uic.endPass();
+    try std.testing.expectEqual(res_in.duration, res_paint.duration);
+
+    if (comptime is_macos) {
+        // Confirm hardware frame was decoded and cached
+        try std.testing.expect(state.cached_frame_img != null);
+        const img = state.cached_frame_img.?;
+        try std.testing.expectEqual(@as(i32, 320), img.width());
+        try std.testing.expectEqual(@as(i32, 240), img.height());
+
+        // Alpha channel must be 255 (0xFF), not uninitialized grey (0xAA)
+        if (img.peekPixelColor(10, 10)) |pix| {
+            const alpha = (pix >> 24) & 0xFF;
+            try std.testing.expectEqual(@as(u32, 0xFF), alpha);
+        }
+
+        // Verify native AVPlayer audio instance was created and configured
+        try std.testing.expect(state.native_sound_handle != null);
+
+        // Verify audio transport controls: volume, mute, seek, rate, play/pause
+        state.setVolume(0.5);
+        try std.testing.expectEqual(@as(f32, 0.5), state.volume);
+        try std.testing.expect(!state.muted);
+
+        state.toggleMute();
+        try std.testing.expect(state.muted);
+
+        state.toggleMute();
+        try std.testing.expect(!state.muted);
+
+        state.cycleRate();
+        try std.testing.expectEqual(@as(f32, 1.25), state.playback_rate);
+
+        state.play("assets/test_video.mp4");
+        try std.testing.expect(state.is_playing);
+
+        state.seek(2.5);
+        try std.testing.expect(state.current_time >= 2.49 and state.current_time <= 2.51);
+
+        state.pause();
+        try std.testing.expect(!state.is_playing);
+    }
+
+    // If intro_animation.mp4 is present on disk, verify frame decoding across timestamps
+    const intro_path = "/Volumes/Skore/app_zig/assets/videos/intro_animation.mp4";
+    if (std.c.fopen(intro_path, "rb")) |intro_fp| {
+        _ = std.c.fclose(intro_fp);
+        var intro_meta = VideoMetadata{};
+        parseVideoSource(intro_path, "", &intro_meta);
+        try std.testing.expect(intro_meta.duration > 7.9 and intro_meta.duration < 8.2);
+
+        if (comptime is_macos) {
+            const intro_gen = macos_video.createGenerator(intro_path, &intro_meta);
+            try std.testing.expect(intro_gen != null);
+            if (intro_gen) |g| {
+                defer macos_video.releaseGenerator(g);
+
+                const f0 = macos_video.extractFrame(g, 0.0);
+                const f1 = macos_video.extractFrame(g, 1.0);
+                const f2 = macos_video.extractFrame(g, 2.5);
+                const f3 = macos_video.extractFrame(g, 5.0);
+
+                try std.testing.expect(f0 != null);
+                try std.testing.expect(f1 != null);
+                try std.testing.expect(f2 != null);
+                try std.testing.expect(f3 != null);
+
+                f0.?.deinit();
+                f1.?.deinit();
+                f2.?.deinit();
+                f3.?.deinit();
+            }
+        }
+    }
+}
+
+

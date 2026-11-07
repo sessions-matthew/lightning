@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
         ui_mod.linkFramework("PDFKit", .{});
         ui_mod.linkFramework("AVFoundation", .{});
         ui_mod.linkFramework("CoreMedia", .{});
+        ui_mod.linkFramework("CoreVideo", .{});
     }
 
     // `platform` module (C-ABI plugin boundary, StateStore, dylib hot-loader, macOS Metal / Win32 host)
@@ -137,6 +138,7 @@ pub fn build(b: *std.Build) void {
         window_exe.root_module.linkFramework("Metal", .{});
         window_exe.root_module.linkFramework("QuartzCore", .{});
         window_exe.root_module.linkFramework("CoreFoundation", .{});
+        window_exe.root_module.linkFramework("CoreVideo", .{});
         window_exe.root_module.linkSystemLibrary("objc", .{});
         window_exe.root_module.addRPath(.{ .cwd_relative = "@executable_path/../lib" });
     } else if (is_windows) {

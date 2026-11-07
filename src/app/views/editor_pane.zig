@@ -384,6 +384,7 @@ fn buildEditorGroupPane(
                 // file list changes (files added/removed), leaving `native_generator_handle` pointing at
                 // a retained ObjC object owned by a stale state slot that then gets extracted from.
                 const vid_view = &state.video_views[vid_slot];
+                vid_view.slot_index = @intCast(vid_slot);
                 const vid_res = uic.videoPlayer(vid_id, 0.0, code_area_h, vid_view, .{
                     .file_path = active_file.path,
                     .raw_bytes = active_buf.slice(),
